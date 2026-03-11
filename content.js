@@ -26,6 +26,7 @@
   let suppressObserver = false;
   let lifecycleTimer = null;
   let errorGuardInstalled = false;
+  let pendingSearchFocus = null;
 
   boot().catch((error) => handleContextError(error));
 
@@ -917,8 +918,23 @@
     search.className = "cg-branch-search";
     search.placeholder = "搜索节点...";
     search.value = appState.searchQuery;
+    search.onkeydown = (event) => {
+      event.stopPropagation();
+    };
+    search.onkeyup = (event) => {
+      event.stopPropagation();
+    };
+    search.onkeypress = (event) => {
+      event.stopPropagation();
+    };
     search.oninput = (e) => {
-      appState.searchQuery = String(e.target.value || "");
+      const inputEl = e.target;
+      appState.searchQuery = String(inputEl.value || "");
+      pendingSearchFocus = {
+        value: appState.searchQuery,
+        start: Number.isFinite(inputEl.selectionStart) ? inputEl.selectionStart : null,
+        end: Number.isFinite(inputEl.selectionEnd) ? inputEl.selectionEnd : null
+      };
       render();
     };
     tools.appendChild(search);
@@ -956,6 +972,25 @@
     rootEl.appendChild(body);
     if (!appState.collapsed) {
       installResizeHandles();
+    }
+    restorePendingSearchFocus();
+  }
+
+  function restorePendingSearchFocus() {
+    if (!pendingSearchFocus) return;
+    const state = pendingSearchFocus;
+    pendingSearchFocus = null;
+    const input = rootEl ? rootEl.querySelector(".cg-branch-search") : null;
+    if (!input) return;
+    input.focus({ preventScroll: true });
+    if (typeof state.start === "number" && typeof state.end === "number") {
+      const max = input.value.length;
+      const start = clamp(state.start, 0, max);
+      const end = clamp(state.end, 0, max);
+      input.setSelectionRange(start, end);
+    } else {
+      const max = input.value.length;
+      input.setSelectionRange(max, max);
     }
   }
 
