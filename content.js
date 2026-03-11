@@ -555,14 +555,36 @@
     return "回答";
   }
 
+  function findExistingNodeForMessage(message) {
+    if (!message) return null;
+    return appState.nodes.find((n) =>
+      n.messageKey === message.key ||
+      (n.anchorId && message.anchorId && n.anchorId === message.anchorId) ||
+      (n.messageHash === message.hash && n.role === message.role)
+    ) || null;
+  }
+
+  function removeNodeById(nodeId) {
+    const target = appState.nodes.find((n) => n.id === nodeId);
+    if (!target) return false;
+    const parentId = target.parentId || null;
+    appState.nodes = appState.nodes
+      .filter((n) => n.id !== nodeId)
+      .map((n) => (n.parentId === nodeId ? { ...n, parentId } : n));
+    if (appState.selectedNodeId === nodeId) {
+      appState.selectedNodeId = parentId || (appState.nodes[appState.nodes.length - 1]?.id || null);
+    }
+    return true;
+  }
+
   async function createNodeFromMessage(message) {
-    const existing = appState.nodes.find((n) => n.messageKey === message.key || (n.messageHash === message.hash && n.role === message.role));
+    const existing = findExistingNodeForMessage(message);
     if (existing) {
-      appState.selectedNodeId = existing.id;
+      removeNodeById(existing.id);
       await saveState();
       render();
       flashMessage(message.element);
-      showToast("这个消息已经有节点，已切换到它。");
+      showToast("已取消该节点。");
       return;
     }
 
@@ -1228,7 +1250,6 @@
     list.className = "cg-lite-list";
     const allGroups = getNavigationGroups();
     const navGroups = filterNavigationGroups(allGroups, appState.searchQuery);
-    const nodeKeys = new Set(appState.nodes.map((node) => node.messageKey));
     if (!navGroups.length) {
       const empty = document.createElement("div");
       empty.className = "cg-lite-empty";
@@ -1249,13 +1270,6 @@
           const sub = document.createElement("button");
           sub.type = "button";
           sub.className = "cg-lite-item-sub";
-          if (nodeKeys.has(group.assistant.key)) {
-            sub.dataset.node = "true";
-            const marker = document.createElement("span");
-            marker.className = "cg-lite-node-marker";
-            marker.textContent = "✦";
-            sub.appendChild(marker);
-          }
           const label = document.createElement("span");
           label.textContent = `ChatGPT：${autoTitle(group.assistant.text, group.assistant.role)}`;
           sub.appendChild(label);
@@ -1633,7 +1647,6 @@
     const allGroups = getNavigationGroups();
     const navGroups = filterNavigationGroups(allGroups, appState.searchQuery);
     const query = cleanText(appState.searchQuery).toLowerCase();
-    const nodeKeys = new Set(appState.nodes.map((node) => node.messageKey));
     const currentIndex = getCurrentViewportMessageIndex();
     const currentMessage = navMessages[currentIndex] || null;
 
@@ -1649,9 +1662,6 @@
       const dot = document.createElement("span");
       dot.className = "cg-branch-nav-row-dot";
       dot.dataset.role = group.user ? group.user.role : (group.assistant ? group.assistant.role : "assistant");
-      if ((group.user && nodeKeys.has(group.user.key)) || (group.assistant && nodeKeys.has(group.assistant.key))) {
-        dot.dataset.node = "true";
-      }
       if (currentMessage && ((group.user && currentMessage.key === group.user.key) || (group.assistant && currentMessage.key === group.assistant.key))) {
         dot.dataset.current = "true";
       }
@@ -1668,9 +1678,6 @@
         sub.className = "cg-branch-nav-overview-sub";
         sub.textContent = `ChatGPT：${autoTitle(group.assistant.text, group.assistant.role)}`;
         sub.title = cleanText(group.assistant.text).slice(0, 160);
-        if (nodeKeys.has(group.assistant.key)) {
-          sub.dataset.node = "true";
-        }
         if (currentMessage && currentMessage.key === group.assistant.key) {
           sub.dataset.current = "true";
         }
