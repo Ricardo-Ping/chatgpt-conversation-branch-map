@@ -245,6 +245,11 @@
   function getRole(el) {
     const attr = el.getAttribute("data-message-author-role");
     if (attr) return attr;
+    const childRoleEl = el.querySelector && el.querySelector("[data-message-author-role]");
+    if (childRoleEl) {
+      const childRole = childRoleEl.getAttribute("data-message-author-role");
+      if (childRole) return childRole;
+    }
     const txt = el.innerText || "";
     if (/^chatgpt|^assistant/i.test(txt)) return "assistant";
     return el.className && String(el.className).toLowerCase().includes("user") ? "user" : null;
@@ -265,11 +270,18 @@
     const candidates = collectMessageCandidates();
     const deduped = [];
     const seenFingerprints = new Set();
+    const seenTurnIds = new Set();
 
     candidates.forEach((el, index) => {
       const role = getRole(el) || (index % 2 === 0 ? "user" : "assistant");
       const text = cleanText(el.innerText || el.textContent || "");
       if (!text) return;
+      const turnHost = el.closest && el.closest('article[data-testid^="conversation-turn-"],article[data-testid*="conversation-turn"]');
+      const turnId = (turnHost && turnHost.getAttribute("data-testid")) || el.getAttribute("data-testid");
+      if (turnId) {
+        if (seenTurnIds.has(turnId)) return;
+        seenTurnIds.add(turnId);
+      }
       const fingerprint = `${role}|${simpleHash(text.slice(0, 2000))}`;
       if (seenFingerprints.has(fingerprint)) return;
       seenFingerprints.add(fingerprint);
@@ -292,6 +304,16 @@
 
   function collectMessageCandidates() {
     const seen = new Set();
+    const turnContainers = [];
+
+    document.querySelectorAll('article[data-testid^="conversation-turn-"],article[data-testid*="conversation-turn"]').forEach((el) => {
+      const container = normalizeMessageContainer(el);
+      if (!container || seen.has(container)) return;
+      seen.add(container);
+      turnContainers.push(container);
+    });
+    if (turnContainers.length) return turnContainers;
+
     const roleContainers = [];
 
     document.querySelectorAll('[data-message-author-role]').forEach((el) => {
@@ -1195,11 +1217,15 @@
     actions.append(toTop, toBottom, prevNode, nextNode);
     wrap.appendChild(actions);
 
+    const navMain = document.createElement("div");
+    navMain.className = "cg-branch-nav-main";
+
     const rail = document.createElement("div");
     rail.className = "cg-branch-nav-rail-vertical";
     if (!cachedMessages.length) {
       rail.innerHTML = "<div class='cg-branch-nav-empty'>暂无消息导航</div>";
-      wrap.appendChild(rail);
+      navMain.appendChild(rail);
+      wrap.appendChild(navMain);
       return wrap;
     }
 
@@ -1245,10 +1271,11 @@
       overview.appendChild(line);
     }
 
+    navMain.append(rail, overview);
     const summary = document.createElement("div");
     summary.className = "cg-branch-nav-summary";
     summary.textContent = `消息 ${total} 条`;
-    wrap.append(rail, overview, summary);
+    wrap.append(navMain, summary);
     return wrap;
   }
 
