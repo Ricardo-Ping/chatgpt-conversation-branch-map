@@ -1046,26 +1046,19 @@
       return false;
     };
 
-    // Step 1: 优先在目标消息所在 turn 内找“更多”
+    // Step 1: 只点目标消息下最可能的“更多”按钮（避免误点其他按钮）
     const localTriggers = getLikelyMenuTriggers(turnHost);
-    for (const trigger of localTriggers) {
-      if (await tryOpenMenuAndClick(trigger)) return true;
-    }
+    const firstLocal = localTriggers[0] || null;
+    if (firstLocal && await tryOpenMenuAndClick(firstLocal)) return true;
 
     // Step 2: 鼠标进入后再尝试（ChatGPT 会延迟显示动作区）
     turnHost.dispatchEvent(new MouseEvent("mouseenter", { bubbles: true, cancelable: true }));
     await wait(220);
     const hoverTriggers = getLikelyMenuTriggers(turnHost);
-    for (const trigger of hoverTriggers) {
-      if (await tryOpenMenuAndClick(trigger)) return true;
-    }
+    const firstHover = hoverTriggers[0] || null;
+    if (firstHover && firstHover !== firstLocal && await tryOpenMenuAndClick(firstHover)) return true;
 
-    // Step 3: 扩大到整页可见动作按钮兜底
-    const pageTriggers = getLikelyMenuTriggers(document);
-    for (const trigger of pageTriggers) {
-      if (await tryOpenMenuAndClick(trigger)) return true;
-    }
-
+    // Step 3: 最后仅在目标消息上触发一次右键菜单兜底
     host.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: host.getBoundingClientRect().left + 16, clientY: host.getBoundingClientRect().top + 16 }));
     await wait(260);
     const fallbackItem = findNativeBranchMenuItem();
@@ -1076,8 +1069,9 @@
   }
 
   function findNativeBranchMenuItem() {
-    const menus = Array.from(document.querySelectorAll('[role="menu"],[data-radix-popper-content-wrapper]'));
-    const scope = menus.length ? menus : [document];
+    const menus = Array.from(document.querySelectorAll('[role="menu"],[data-radix-popper-content-wrapper]'))
+      .filter((el) => isElementActuallyVisible(el));
+    const scope = menus.length ? [menus[menus.length - 1]] : [document];
     const items = scope
       .flatMap((root) => Array.from(root.querySelectorAll('[role="menuitem"],button,a,div')))
       .filter((el) => isElementActuallyVisible(el));
