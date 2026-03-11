@@ -444,9 +444,29 @@
         host.appendChild(button);
       }
 
+      if (!host.dataset.cgTagDelayBound) {
+        host.dataset.cgTagDelayBound = "true";
+        host.addEventListener("mouseenter", () => {
+          if (host._cgTagHideTimer) {
+            clearTimeout(host._cgTagHideTimer);
+            host._cgTagHideTimer = null;
+          }
+          host.classList.add("cg-branch-tag-host-visible");
+        });
+        host.addEventListener("mouseleave", () => {
+          if (host.classList.contains("cg-branch-tag-host-pinned")) return;
+          if (host._cgTagHideTimer) clearTimeout(host._cgTagHideTimer);
+          host._cgTagHideTimer = setTimeout(() => {
+            host.classList.remove("cg-branch-tag-host-visible");
+            host._cgTagHideTimer = null;
+          }, 3000);
+        });
+      }
+
       const exists = appState.nodes.find((n) => n.messageKey === message.key || (n.messageHash === message.hash && n.role === message.role));
       if (exists) {
         host.classList.add("cg-branch-tag-host-pinned");
+        host.classList.add("cg-branch-tag-host-visible");
         button.textContent = "已建节点";
       } else {
         host.classList.remove("cg-branch-tag-host-pinned");

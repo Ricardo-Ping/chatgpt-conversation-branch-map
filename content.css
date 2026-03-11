@@ -739,11 +739,13 @@
   font-weight: 700;
   opacity: 0;
   pointer-events: none;
+  transition: opacity 180ms ease;
 }
 
 .cg-branch-tag-host { position: relative; }
 
 .cg-branch-tag-host:hover .cg-branch-tag-btn,
+.cg-branch-tag-host.cg-branch-tag-host-visible .cg-branch-tag-btn,
 .cg-branch-tag-host.cg-branch-tag-host-pinned .cg-branch-tag-btn {
   opacity: 1;
   pointer-events: auto;
