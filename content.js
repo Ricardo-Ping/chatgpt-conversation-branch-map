@@ -79,7 +79,7 @@
     if (!appState || typeof appState !== "object") appState = createEmptyState();
     if (!Array.isArray(appState.nodes)) appState.nodes = [];
     if (!appState.viewMode) appState.viewMode = VIEW_MODE.MAP;
-    if (!appState.mode) appState.mode = "lite";
+    appState.mode = "lite";
     if (typeof appState.liteOpen !== "boolean") appState.liteOpen = true;
     if (!appState.liteDock || typeof appState.liteDock !== "object") {
       appState.liteDock = { x: null, y: 180, side: "right" };
@@ -893,14 +893,15 @@
     if (!rootEl) return;
 
     mapRuntime = null;
-    if (appState.mode === "lite") {
-      renderLiteMode();
-      return;
-    }
     if (appState.minimalMode) {
       renderMinimalDock();
       return;
     }
+    appState.mode = "lite";
+    renderLiteMode();
+    return;
+
+    /*
     rootEl.classList.remove("cg-lite-root");
     rootEl.classList.remove("cg-compact-root");
     rootEl.classList.remove("cg-compact-left");
@@ -1052,13 +1053,14 @@
       installResizeHandles();
     }
     restorePendingSearchFocus();
+    */
   }
 
   function restorePendingSearchFocus() {
     if (!pendingSearchFocus) return;
     const state = pendingSearchFocus;
     pendingSearchFocus = null;
-    const input = rootEl ? rootEl.querySelector(".cg-branch-search") : null;
+    const input = rootEl ? rootEl.querySelector(".cg-lite-search, .cg-branch-search") : null;
     if (!input) return;
     input.focus({ preventScroll: true });
     if (typeof state.start === "number" && typeof state.end === "number") {
@@ -1131,18 +1133,60 @@
     refresh.textContent = "扫描";
     refresh.onclick = () => scanMessages();
 
-    const advanced = document.createElement("button");
-    advanced.type = "button";
-    advanced.className = "cg-lite-btn";
-    advanced.textContent = "高级";
-    advanced.onclick = async () => {
-      appState.mode = "advanced";
+    const branch = document.createElement("button");
+    branch.type = "button";
+    branch.className = "cg-lite-btn";
+    branch.textContent = "开分支";
+    branch.onclick = () => openBranchInCurrentTab();
+
+    const minimal = document.createElement("button");
+    minimal.type = "button";
+    minimal.className = "cg-lite-btn";
+    minimal.textContent = "极简";
+    minimal.onclick = async () => {
+      appState.minimalMode = true;
       await saveState();
       render();
     };
-    actions.append(refresh, advanced);
+    actions.append(refresh, branch, minimal);
     head.append(title, actions);
     panel.appendChild(head);
+
+    const searchWrap = document.createElement("div");
+    searchWrap.className = "cg-lite-search-wrap";
+    const search = document.createElement("input");
+    search.className = "cg-branch-search cg-lite-search";
+    search.placeholder = "搜索节点...";
+    search.value = appState.searchQuery;
+    let imeComposing = false;
+    search.onkeydown = (event) => event.stopPropagation();
+    search.addEventListener("compositionstart", () => {
+      imeComposing = true;
+    });
+    search.addEventListener("compositionend", (event) => {
+      imeComposing = false;
+      const inputEl = event.target;
+      appState.searchQuery = String(inputEl.value || "");
+      pendingSearchFocus = {
+        value: appState.searchQuery,
+        start: Number.isFinite(inputEl.selectionStart) ? inputEl.selectionStart : null,
+        end: Number.isFinite(inputEl.selectionEnd) ? inputEl.selectionEnd : null
+      };
+      render();
+    });
+    search.oninput = (event) => {
+      const inputEl = event.target;
+      if (imeComposing || event.isComposing) return;
+      appState.searchQuery = String(inputEl.value || "");
+      pendingSearchFocus = {
+        value: appState.searchQuery,
+        start: Number.isFinite(inputEl.selectionStart) ? inputEl.selectionStart : null,
+        end: Number.isFinite(inputEl.selectionEnd) ? inputEl.selectionEnd : null
+      };
+      render();
+    };
+    searchWrap.appendChild(search);
+    panel.appendChild(searchWrap);
 
     const quick = document.createElement("div");
     quick.className = "cg-lite-quick";
@@ -1161,11 +1205,12 @@
 
     const list = document.createElement("div");
     list.className = "cg-lite-list";
-    const navGroups = getNavigationGroups();
+    const allGroups = getNavigationGroups();
+    const navGroups = filterNavigationGroups(allGroups, appState.searchQuery);
     if (!navGroups.length) {
       const empty = document.createElement("div");
       empty.className = "cg-lite-empty";
-      empty.textContent = "暂无问题，点击“扫描”更新。";
+      empty.textContent = appState.searchQuery ? "没有匹配结果。" : "暂无问题，点击“扫描”更新。";
       list.appendChild(empty);
     } else {
       navGroups.forEach((group, index) => {
@@ -1195,6 +1240,7 @@
     }
     panel.appendChild(list);
     rootEl.appendChild(panel);
+    restorePendingSearchFocus();
   }
 
   function getNavigationMessages() {
@@ -1217,6 +1263,16 @@
       groups.push({ user: null, assistant: message });
     });
     return groups;
+  }
+
+  function filterNavigationGroups(groups, rawQuery) {
+    const query = cleanText(rawQuery).toLowerCase();
+    if (!query) return groups;
+    return groups.filter((group) => {
+      const u = group.user ? `${group.user.text}\n${group.user.snippet || ""}`.toLowerCase() : "";
+      const a = group.assistant ? `${group.assistant.text}\n${group.assistant.snippet || ""}`.toLowerCase() : "";
+      return u.includes(query) || a.includes(query);
+    });
   }
 
   function countQuestionMessages(messages) {
@@ -1555,14 +1611,8 @@
 
     const navMessages = getNavigationMessages();
     const allGroups = getNavigationGroups();
+    const navGroups = filterNavigationGroups(allGroups, appState.searchQuery);
     const query = cleanText(appState.searchQuery).toLowerCase();
-    const navGroups = !query
-      ? allGroups
-      : allGroups.filter((group) => {
-          const u = group.user ? `${group.user.text}\n${group.user.snippet || ""}`.toLowerCase() : "";
-          const a = group.assistant ? `${group.assistant.text}\n${group.assistant.snippet || ""}`.toLowerCase() : "";
-          return u.includes(query) || a.includes(query);
-        });
     const nodeKeys = new Set(appState.nodes.map((node) => node.messageKey));
     const currentIndex = getCurrentViewportMessageIndex();
     const currentMessage = navMessages[currentIndex] || null;

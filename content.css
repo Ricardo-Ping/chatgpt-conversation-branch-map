@@ -120,6 +120,10 @@
   border-bottom: 1px solid rgba(88, 104, 133, 0.12);
 }
 
+.cg-lite-search-wrap {
+  padding: 8px 10px 0;
+}
+
 .cg-lite-list {
   padding: 8px;
   overflow: auto;
