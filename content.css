@@ -145,11 +145,20 @@
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
+  position: relative;
+  transition: box-shadow 220ms ease, border-color 220ms ease, background-color 220ms ease, transform 220ms ease;
 }
 
 .cg-lite-item:hover {
   background: rgba(83, 145, 214, 0.12);
   border-color: rgba(61, 122, 194, 0.36);
+}
+
+.cg-lite-item-current {
+  border-color: rgba(44, 131, 201, 0.52);
+  background: linear-gradient(180deg, rgba(236, 247, 255, 0.96), rgba(228, 243, 255, 0.95));
+  box-shadow: 0 10px 22px rgba(39, 109, 176, 0.18), inset 0 0 0 1px rgba(72, 150, 220, 0.18);
+  transform: translateX(2px);
 }
 
 .cg-lite-item > span {

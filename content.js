@@ -28,6 +28,7 @@
   let errorGuardInstalled = false;
   let pendingSearchFocus = null;
   let branchOpening = false;
+  let liteViewportSyncCleanup = null;
 
   boot().catch((error) => handleContextError(error));
 
@@ -935,6 +936,11 @@
   function render() {
     if (!rootEl) return;
 
+    if (liteViewportSyncCleanup) {
+      liteViewportSyncCleanup();
+      liteViewportSyncCleanup = null;
+    }
+
     mapRuntime = null;
     if (appState.minimalMode) {
       renderMinimalDock();
@@ -1264,7 +1270,9 @@
         item.className = "cg-lite-item";
         item.title = cleanText(primary.text).slice(0, 200);
         item.innerHTML = `<span>${index + 1}</span><strong>${escapeHtml(`${primary.role === "assistant" ? "ChatGPT 说" : "你说"}：${autoTitle(primary.text, primary.role)}`)}</strong>`;
-        item.onclick = () => jumpToMessage(primary);
+        const focusMessage = group.user || primary;
+        item.dataset.messageKey = focusMessage.key || "";
+        item.onclick = () => jumpToMessage(focusMessage);
 
         if (group.user && group.assistant) {
           const sub = document.createElement("button");
@@ -1285,7 +1293,51 @@
     }
     panel.appendChild(list);
     rootEl.appendChild(panel);
+    installLiteViewportSync(list);
     restorePendingSearchFocus();
+  }
+
+  function installLiteViewportSync(listEl) {
+    if (!listEl) return;
+    const rows = Array.from(listEl.querySelectorAll(".cg-lite-item"));
+    if (!rows.length) return;
+    const rowByKey = new Map(rows.map((row) => [row.dataset.messageKey, row]));
+
+    const container = getChatScrollContainer();
+    let rafId = 0;
+
+    const update = () => {
+      rafId = 0;
+      const source = getNavigationMessages().filter((m) => m.role === "user");
+      const messages = source.length ? source : getNavigationMessages();
+      if (!messages.length) return;
+      const currentIndex = getCurrentViewportMessageIndex(messages);
+      const current = messages[currentIndex];
+      rows.forEach((row) => row.classList.remove("cg-lite-item-current"));
+      if (current && rowByKey.has(current.key)) {
+        rowByKey.get(current.key).classList.add("cg-lite-item-current");
+      }
+    };
+
+    const schedule = () => {
+      if (rafId) return;
+      rafId = requestAnimationFrame(update);
+    };
+
+    const onScroll = () => schedule();
+    container.addEventListener("scroll", onScroll, { passive: true });
+    window.addEventListener("resize", onScroll, { passive: true });
+
+    liteViewportSyncCleanup = () => {
+      container.removeEventListener("scroll", onScroll);
+      window.removeEventListener("resize", onScroll);
+      if (rafId) {
+        cancelAnimationFrame(rafId);
+        rafId = 0;
+      }
+    };
+
+    schedule();
   }
 
   function getNavigationMessages() {
