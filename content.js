@@ -262,29 +262,7 @@
   }
 
   function findMessages() {
-    const candidates = [];
-    const seen = new Set();
-    for (const selector of MESSAGE_SELECTORS) {
-      document.querySelectorAll(selector).forEach((el) => {
-        if (seen.has(el)) return;
-        const role = getRole(el);
-        const text = cleanText(el.innerText || el.textContent || "");
-        if (!role || !text) return;
-        seen.add(el);
-        candidates.push(el);
-      });
-    }
-
-    if (!candidates.length) {
-      document.querySelectorAll("main article").forEach((el) => {
-        if (seen.has(el)) return;
-        const text = cleanText(el.innerText || el.textContent || "");
-        if (!text) return;
-        seen.add(el);
-        candidates.push(el);
-      });
-    }
-
+    const candidates = collectMessageCandidates();
     const occurrences = new Map();
     return candidates.map((el, index) => {
       const role = getRole(el) || (index % 2 === 0 ? "user" : "assistant");
@@ -299,6 +277,56 @@
       el.dataset.cgBranchAnchor = anchorId;
       return { element: el, key, hash, anchorId, role, index, text };
     });
+  }
+
+  function collectMessageCandidates() {
+    const unique = [];
+    const seen = new Set();
+    const roleAware = [];
+
+    for (const selector of MESSAGE_SELECTORS) {
+      document.querySelectorAll(selector).forEach((el) => {
+        const container = normalizeMessageContainer(el);
+        if (!container) return;
+        if (seen.has(container)) return;
+        seen.add(container);
+        unique.push(container);
+        if (getRole(container)) roleAware.push(container);
+      });
+    }
+
+    if (roleAware.length) {
+      return roleAware;
+    }
+
+    if (unique.length) {
+      return unique;
+    }
+
+    const fallback = [];
+    document.querySelectorAll("main article").forEach((el) => {
+      const container = normalizeMessageContainer(el);
+      if (!container || seen.has(container)) return;
+      const text = cleanText(container.innerText || container.textContent || "");
+      if (!text) return;
+      seen.add(container);
+      fallback.push(container);
+    });
+    return fallback;
+  }
+
+  function normalizeMessageContainer(el) {
+    if (!el || el.nodeType !== 1) return null;
+    if (el.closest && el.closest(`#${ROOT_ID}`)) return null;
+    const container =
+      el.closest('[data-message-author-role]') ||
+      el.closest('article[data-testid^="conversation-turn-"]') ||
+      el.closest('article[data-testid*="conversation-turn"]') ||
+      el;
+    if (!container || (container.closest && container.closest(`#${ROOT_ID}`))) return null;
+    const text = cleanText(container.innerText || container.textContent || "");
+    if (!text) return null;
+    return container;
   }
 
   function getButtonHost(messageEl) {
