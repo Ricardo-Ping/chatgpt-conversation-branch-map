@@ -23,6 +23,7 @@
   let lastPathname = location.pathname;
   let mapRuntime = null;
   let cachedMessages = [];
+  let suppressObserver = false;
 
   boot();
 
@@ -67,6 +68,7 @@
       appState.liteDock = { x: null, y: 180, side: "right" };
     }
     if (!["left", "right"].includes(appState.liteDock.side)) appState.liteDock.side = "right";
+    if (!(Number.isFinite(appState.liteDock.x) || appState.liteDock.x === null)) appState.liteDock.x = null;
     if (!Number.isFinite(appState.liteDock.y)) appState.liteDock.y = 180;
     if (typeof appState.autoRefresh !== "boolean") appState.autoRefresh = true;
     if (!appState.panel) appState.panel = { width: 380, height: 500 };
@@ -133,12 +135,42 @@
 
   function installObserver() {
     if (observer) observer.disconnect();
-    observer = new MutationObserver(() => {
+    observer = new MutationObserver((mutations) => {
       if (!appState.autoRefresh) return;
+      if (suppressObserver) return;
+      if (isOnlyPluginMutations(mutations)) return;
       clearTimeout(scanTimer);
       scanTimer = setTimeout(scanMessages, 280);
     });
     observer.observe(document.body, { childList: true, subtree: true });
+  }
+
+  function isOnlyPluginMutations(mutations) {
+    const hasNonPluginNode = (node) => {
+      if (!node || node.nodeType !== 1) return false;
+      const el = node;
+      if (el.id === ROOT_ID) return false;
+      if (el.classList && Array.from(el.classList).some((cls) => cls.startsWith("cg-branch-") || cls.startsWith("cg-lite-"))) {
+        return false;
+      }
+      if (el.closest && el.closest(`#${ROOT_ID}`)) return false;
+      if (el.closest && el.closest(".cg-branch-toast")) return false;
+      return true;
+    };
+
+    for (const mutation of mutations) {
+      if (mutation.target && mutation.target.nodeType === 1) {
+        const target = mutation.target;
+        if (target.closest && target.closest(`#${ROOT_ID}`)) continue;
+      }
+      for (const node of mutation.addedNodes || []) {
+        if (hasNonPluginNode(node)) return false;
+      }
+      for (const node of mutation.removedNodes || []) {
+        if (hasNonPluginNode(node)) return false;
+      }
+    }
+    return true;
   }
 
   function getRole(el) {
@@ -207,6 +239,7 @@
   }
 
   function scanMessages() {
+    suppressObserver = true;
     cachedMessages = findMessages();
     injectTagButtons(cachedMessages);
     syncNodesWithMessages(cachedMessages);
@@ -216,6 +249,7 @@
       showToast(`已扫描 ${cachedMessages.length} 条消息。`);
     }
     render();
+    setTimeout(() => { suppressObserver = false; }, 80);
   }
 
   function injectTagButtons(messages) {
@@ -703,9 +737,14 @@
     rootEl.style.width = "auto";
     rootEl.style.height = "auto";
     rootEl.style.top = `${clamp(appState.liteDock.y, 12, Math.max(12, window.innerHeight - 70))}px`;
+    const dockX = Number.isFinite(appState.liteDock.x)
+      ? clamp(appState.liteDock.x, 8, Math.max(8, window.innerWidth - 360))
+      : null;
     rootEl.style.left = "";
     rootEl.style.right = "";
-    if (appState.liteDock.side === "left") {
+    if (dockX !== null) {
+      rootEl.style.left = `${dockX}px`;
+    } else if (appState.liteDock.side === "left") {
       rootEl.style.left = "12px";
     } else {
       rootEl.style.right = "12px";
@@ -800,12 +839,16 @@
 
   function extractQuestionMessages() {
     const messages = cachedMessages.length ? cachedMessages : findMessages();
-    return messages.filter((message) => {
+    const userMessages = messages.filter((message) => message.role === "user");
+    const questions = userMessages.filter((message) => {
       if (message.role !== "user") return false;
       const text = cleanText(message.text);
       if (!text) return false;
       return /[?？]|\b(怎么|如何|为什么|是否|能否|请问|what|how|why|can|could)\b/i.test(text.slice(0, 220));
     });
+    if (questions.length) return questions;
+    if (userMessages.length) return userMessages;
+    return messages.slice(0, 12);
   }
 
   function installLiteEyeDrag(eyeEl) {
@@ -814,6 +857,7 @@
     let startX = 0;
     let startY = 0;
     let startTop = 0;
+    let startLeft = 0;
 
     eyeEl.onpointerdown = (event) => {
       if (event.button !== 0) return;
@@ -821,20 +865,18 @@
       startX = event.clientX;
       startY = event.clientY;
       startTop = clamp(appState.liteDock.y, 12, Math.max(12, window.innerHeight - 70));
+      const currentLeft = rootEl.getBoundingClientRect().left;
+      startLeft = clamp(currentLeft, 8, Math.max(8, window.innerWidth - 80));
       eyeEl.setPointerCapture(event.pointerId);
       eyeEl.classList.add("cg-lite-eye-dragging");
 
       const onMove = (mv) => {
         dragging = true;
         const nextTop = clamp(startTop + (mv.clientY - startY), 12, Math.max(12, window.innerHeight - 70));
+        const nextLeft = clamp(startLeft + (mv.clientX - startX), 8, Math.max(8, window.innerWidth - 80));
         rootEl.style.top = `${nextTop}px`;
-        if (mv.clientX < window.innerWidth / 2) {
-          rootEl.style.left = "12px";
-          rootEl.style.right = "";
-        } else {
-          rootEl.style.left = "";
-          rootEl.style.right = "12px";
-        }
+        rootEl.style.left = `${nextLeft}px`;
+        rootEl.style.right = "";
       };
 
       const onUp = async (up) => {
@@ -849,6 +891,7 @@
         const snappedTop = clamp(startTop + (up.clientY - startY), 12, Math.max(12, window.innerHeight - 70));
         appState.liteDock.side = snappedSide;
         appState.liteDock.y = snappedTop;
+        appState.liteDock.x = null;
         await saveState();
         render();
       };
