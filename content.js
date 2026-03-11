@@ -1425,7 +1425,7 @@
     rootEl.dataset.minimal = "true";
     rootEl.dataset.collapsed = "false";
     rootEl.style.width = "84px";
-    rootEl.style.height = "300px";
+    rootEl.style.height = "auto";
     applyCompactDockPosition();
     rootEl.innerHTML = "";
 
