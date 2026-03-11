@@ -263,10 +263,21 @@
 
   function findMessages() {
     const candidates = collectMessageCandidates();
-    const occurrences = new Map();
-    return candidates.map((el, index) => {
+    const deduped = [];
+    const seenFingerprints = new Set();
+
+    candidates.forEach((el, index) => {
       const role = getRole(el) || (index % 2 === 0 ? "user" : "assistant");
       const text = cleanText(el.innerText || el.textContent || "");
+      if (!text) return;
+      const fingerprint = `${role}|${simpleHash(text.slice(0, 2000))}`;
+      if (seenFingerprints.has(fingerprint)) return;
+      seenFingerprints.add(fingerprint);
+      deduped.push({ el, role, text });
+    });
+
+    const occurrences = new Map();
+    return deduped.map(({ el, role, text }, index) => {
       const hash = simpleHash(`${role}|${text.slice(0, 1500)}`);
       const count = (occurrences.get(hash) || 0) + 1;
       occurrences.set(hash, count);
@@ -280,10 +291,20 @@
   }
 
   function collectMessageCandidates() {
-    const unique = [];
     const seen = new Set();
-    const roleAware = [];
+    const roleContainers = [];
 
+    document.querySelectorAll('[data-message-author-role]').forEach((el) => {
+      const container = normalizeMessageContainer(el);
+      if (!container || seen.has(container)) return;
+      seen.add(container);
+      roleContainers.push(container);
+    });
+    if (roleContainers.length) {
+      return roleContainers;
+    }
+
+    const unique = [];
     for (const selector of MESSAGE_SELECTORS) {
       document.querySelectorAll(selector).forEach((el) => {
         const container = normalizeMessageContainer(el);
@@ -291,17 +312,9 @@
         if (seen.has(container)) return;
         seen.add(container);
         unique.push(container);
-        if (getRole(container)) roleAware.push(container);
       });
     }
-
-    if (roleAware.length) {
-      return roleAware;
-    }
-
-    if (unique.length) {
-      return unique;
-    }
+    if (unique.length) return unique;
 
     const fallback = [];
     document.querySelectorAll("main article").forEach((el) => {
@@ -318,15 +331,36 @@
   function normalizeMessageContainer(el) {
     if (!el || el.nodeType !== 1) return null;
     if (el.closest && el.closest(`#${ROOT_ID}`)) return null;
-    const container =
+    let container =
       el.closest('[data-message-author-role]') ||
       el.closest('article[data-testid^="conversation-turn-"]') ||
       el.closest('article[data-testid*="conversation-turn"]') ||
       el;
+    if (!container) return null;
+
+    if (container.hasAttribute("data-message-author-role")) {
+      let parentWithRole = container.parentElement ? container.parentElement.closest('[data-message-author-role]') : null;
+      while (parentWithRole) {
+        container = parentWithRole;
+        parentWithRole = container.parentElement ? container.parentElement.closest('[data-message-author-role]') : null;
+      }
+    }
+
+    if (!container.closest("main")) return null;
     if (!container || (container.closest && container.closest(`#${ROOT_ID}`))) return null;
+    if (!isElementActuallyVisible(container)) return null;
     const text = cleanText(container.innerText || container.textContent || "");
     if (!text) return null;
     return container;
+  }
+
+  function isElementActuallyVisible(el) {
+    if (!el || !el.isConnected) return false;
+    const style = window.getComputedStyle(el);
+    if (!style) return false;
+    if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 8 && rect.height > 8;
   }
 
   function getButtonHost(messageEl) {
@@ -343,7 +377,8 @@
     if (!cachedMessages.length) {
       showToast("未扫描到消息，请先打开一条有内容的对话。");
     } else {
-      showToast(`已扫描 ${cachedMessages.length} 条消息。`);
+      const questionCount = countQuestionMessages(cachedMessages);
+      showToast(`已扫描 ${cachedMessages.length} 条消息（提问 ${questionCount} 条）。`);
     }
     render();
     setTimeout(() => { suppressObserver = false; }, 80);
@@ -964,6 +999,15 @@
     if (questions.length) return questions;
     if (userMessages.length) return userMessages;
     return messages.slice(0, 12);
+  }
+
+  function countQuestionMessages(messages) {
+    return messages.filter((message) => {
+      if (message.role !== "user") return false;
+      const text = cleanText(message.text);
+      if (!text) return false;
+      return /[?？]|\b(怎么|如何|为什么|是否|能否|请问|what|how|why|can|could)\b/i.test(text.slice(0, 220));
+    }).length;
   }
 
   function installLiteEyeDrag(eyeEl) {
