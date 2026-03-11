@@ -63,6 +63,8 @@
       mode: "lite",
       liteOpen: true,
       liteDock: { x: null, y: 180, side: "right" },
+      compactDock: { x: null, y: 84, side: "right" },
+      panelDock: { x: null, y: 84 },
       autoRefresh: true,
       minimalMode: false,
       searchQuery: "",
@@ -83,6 +85,17 @@
     if (!["left", "right"].includes(appState.liteDock.side)) appState.liteDock.side = "right";
     if (!(Number.isFinite(appState.liteDock.x) || appState.liteDock.x === null)) appState.liteDock.x = null;
     if (!Number.isFinite(appState.liteDock.y)) appState.liteDock.y = 180;
+    if (!appState.compactDock || typeof appState.compactDock !== "object") {
+      appState.compactDock = { x: null, y: 84, side: "right" };
+    }
+    if (!["left", "right"].includes(appState.compactDock.side)) appState.compactDock.side = "right";
+    if (!(Number.isFinite(appState.compactDock.x) || appState.compactDock.x === null)) appState.compactDock.x = null;
+    if (!Number.isFinite(appState.compactDock.y)) appState.compactDock.y = 84;
+    if (!appState.panelDock || typeof appState.panelDock !== "object") {
+      appState.panelDock = { x: null, y: 84 };
+    }
+    if (!(Number.isFinite(appState.panelDock.x) || appState.panelDock.x === null)) appState.panelDock.x = null;
+    if (!Number.isFinite(appState.panelDock.y)) appState.panelDock.y = 84;
     if (typeof appState.autoRefresh !== "boolean") appState.autoRefresh = true;
     if (!appState.panel) appState.panel = { width: 380, height: 500 };
     appState.panel.width = clamp(Number(appState.panel.width) || 380, PANEL.minWidth, PANEL.maxWidth);
@@ -789,10 +802,21 @@
       return;
     }
     rootEl.classList.remove("cg-lite-root");
+    rootEl.classList.remove("cg-compact-root");
+    rootEl.classList.remove("cg-compact-left");
+    rootEl.classList.remove("cg-compact-right");
     rootEl.dataset.collapsed = String(Boolean(appState.collapsed));
     rootEl.dataset.minimal = "false";
     rootEl.style.width = `${appState.panel.width}px`;
     rootEl.style.height = appState.collapsed ? "64px" : `${appState.panel.height}px`;
+    if (appState.collapsed) {
+      applyCompactDockPosition();
+      rootEl.classList.add("cg-compact-root");
+      rootEl.classList.toggle("cg-compact-left", appState.compactDock.side === "left");
+      rootEl.classList.toggle("cg-compact-right", appState.compactDock.side !== "left");
+    } else {
+      applyPanelDockPosition();
+    }
     rootEl.innerHTML = "";
 
     const header = document.createElement("div");
@@ -847,6 +871,11 @@
 
     header.append(title, actions);
     rootEl.appendChild(header);
+    if (appState.collapsed) {
+      installCompactDockDrag(header);
+    } else {
+      installAdvancedPanelDrag(header);
+    }
 
     const body = document.createElement("div");
     body.className = "cg-branch-map-body";
@@ -1136,10 +1165,14 @@
   }
 
   function renderMinimalDock() {
+    rootEl.classList.add("cg-compact-root");
+    rootEl.classList.toggle("cg-compact-left", appState.compactDock.side === "left");
+    rootEl.classList.toggle("cg-compact-right", appState.compactDock.side !== "left");
     rootEl.dataset.minimal = "true";
     rootEl.dataset.collapsed = "false";
-    rootEl.style.width = "56px";
-    rootEl.style.height = "260px";
+    rootEl.style.width = "84px";
+    rootEl.style.height = "300px";
+    applyCompactDockPosition();
     rootEl.innerHTML = "";
 
     const dock = document.createElement("div");
@@ -1181,6 +1214,105 @@
 
     dock.append(expand, branch, back, prev, next);
     rootEl.appendChild(dock);
+    installCompactDockDrag(dock);
+  }
+
+  function applyCompactDockPosition() {
+    rootEl.style.top = `${clamp(appState.compactDock.y, 12, Math.max(12, window.innerHeight - 80))}px`;
+    const dockX = Number.isFinite(appState.compactDock.x)
+      ? clamp(appState.compactDock.x, 8, Math.max(8, window.innerWidth - 120))
+      : null;
+    rootEl.style.left = "";
+    rootEl.style.right = "";
+    if (dockX !== null) {
+      rootEl.style.left = `${dockX}px`;
+    } else if (appState.compactDock.side === "left") {
+      rootEl.style.left = "12px";
+    } else {
+      rootEl.style.right = "12px";
+    }
+  }
+
+  function applyPanelDockPosition() {
+    const maxX = Math.max(8, window.innerWidth - appState.panel.width - 8);
+    const x = Number.isFinite(appState.panelDock.x) ? clamp(appState.panelDock.x, 8, maxX) : null;
+    const y = clamp(appState.panelDock.y, 12, Math.max(12, window.innerHeight - 80));
+    rootEl.style.top = `${y}px`;
+    rootEl.style.left = "";
+    rootEl.style.right = "";
+    if (x !== null) {
+      rootEl.style.left = `${x}px`;
+    } else {
+      rootEl.style.right = "18px";
+    }
+  }
+
+  function installAdvancedPanelDrag(headerEl) {
+    if (!headerEl) return;
+    const titleEl = headerEl.querySelector(".cg-branch-map-title");
+    if (!titleEl) return;
+    titleEl.style.touchAction = "none";
+
+    if (typeof window.interact === "function") {
+      if (titleEl._cgInteract && typeof titleEl._cgInteract.unset === "function") {
+        titleEl._cgInteract.unset();
+      }
+      let x = Number.isFinite(appState.panelDock.x)
+        ? clamp(appState.panelDock.x, 8, Math.max(8, window.innerWidth - appState.panel.width - 8))
+        : clamp(rootEl.getBoundingClientRect().left, 8, Math.max(8, window.innerWidth - appState.panel.width - 8));
+      let y = clamp(appState.panelDock.y, 12, Math.max(12, window.innerHeight - 80));
+
+      const api = window.interact(titleEl).draggable({
+        listeners: {
+          move(event) {
+            const maxX = Math.max(8, window.innerWidth - appState.panel.width - 8);
+            x = clamp(x + event.dx, 8, maxX);
+            y = clamp(y + event.dy, 12, Math.max(12, window.innerHeight - 80));
+            rootEl.style.left = `${x}px`;
+            rootEl.style.top = `${y}px`;
+            rootEl.style.right = "";
+          },
+          end() {
+            appState.panelDock.x = x;
+            appState.panelDock.y = y;
+            void saveState().catch((error) => handleContextError(error));
+          }
+        }
+      });
+      titleEl._cgInteract = api;
+    }
+  }
+
+  function installCompactDockDrag(dragHandleEl) {
+    if (!dragHandleEl) return;
+    dragHandleEl.style.touchAction = "none";
+    if (typeof window.interact === "function") {
+      if (dragHandleEl._cgInteract && typeof dragHandleEl._cgInteract.unset === "function") {
+        dragHandleEl._cgInteract.unset();
+      }
+      let x = clamp(rootEl.getBoundingClientRect().left, 8, Math.max(8, window.innerWidth - 96));
+      let y = clamp(rootEl.getBoundingClientRect().top, 8, Math.max(8, window.innerHeight - 80));
+      const api = window.interact(dragHandleEl).draggable({
+        listeners: {
+          move(event) {
+            x = clamp(x + event.dx, 8, Math.max(8, window.innerWidth - 96));
+            y = clamp(y + event.dy, 8, Math.max(8, window.innerHeight - 80));
+            rootEl.style.left = `${x}px`;
+            rootEl.style.top = `${y}px`;
+            rootEl.style.right = "";
+          },
+          end() {
+            const side = x + 48 < window.innerWidth / 2 ? "left" : "right";
+            appState.compactDock.side = side;
+            appState.compactDock.y = clamp(y, 12, Math.max(12, window.innerHeight - 80));
+            appState.compactDock.x = null;
+            void saveState().then(() => render()).catch((error) => handleContextError(error));
+          }
+        }
+      });
+      dragHandleEl._cgInteract = api;
+      return;
+    }
   }
 
   function renderNavigatorBar() {
