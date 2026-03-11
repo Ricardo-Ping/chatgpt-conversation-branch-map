@@ -1417,7 +1417,7 @@
     rootEl.dataset.minimal = "true";
     rootEl.dataset.collapsed = "false";
     rootEl.style.width = "84px";
-    rootEl.style.height = "300px";
+    rootEl.style.height = "236px";
     applyCompactDockPosition();
     rootEl.innerHTML = "";
 
@@ -1434,12 +1434,6 @@
       render();
     };
 
-    const back = document.createElement("button");
-    back.type = "button";
-    back.className = "cg-branch-mini-dock-btn";
-    back.textContent = "返回";
-    back.onclick = () => returnToParentConversation();
-
     const prev = document.createElement("button");
     prev.type = "button";
     prev.className = "cg-branch-mini-dock-btn";
@@ -1452,7 +1446,7 @@
     next.textContent = "下";
     next.onclick = () => jumpNeighborMessage(1);
 
-    dock.append(expand, back, prev, next);
+    dock.append(expand, prev, next);
     rootEl.appendChild(dock);
     installCompactDockDrag(dock);
   }
@@ -1691,8 +1685,8 @@
     return wrap;
   }
 
-  function getCurrentViewportMessageIndex() {
-    if (!cachedMessages.length) {
+  function getCurrentViewportMessageIndex(messages = cachedMessages) {
+    if (!messages.length) {
       return 0;
     }
     const container = getChatScrollContainer();
@@ -1702,7 +1696,7 @@
     let bestIndex = 0;
     let bestDistance = Number.MAX_SAFE_INTEGER;
 
-    cachedMessages.forEach((message, index) => {
+    messages.forEach((message, index) => {
       const rect = message.element.getBoundingClientRect();
       const absCenter = container === window
         ? window.scrollY + rect.top + rect.height / 2
@@ -1755,13 +1749,14 @@
   }
 
   function jumpNeighborMessage(direction) {
-    if (!cachedMessages.length) {
+    const stepMessages = getNavigationMessages().filter((message) => message.role === "user");
+    if (!stepMessages.length) {
       showToast("暂无消息可跳转。");
       return;
     }
-    const current = getCurrentViewportMessageIndex();
-    const next = clamp(current + direction, 0, cachedMessages.length - 1);
-    jumpToMessage(cachedMessages[next]);
+    const current = getCurrentViewportMessageIndex(stepMessages);
+    const next = clamp(current + direction, 0, stepMessages.length - 1);
+    jumpToMessage(stepMessages[next]);
   }
 
   function jumpNeighborNode(direction) {
