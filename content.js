@@ -1775,11 +1775,13 @@
   function renderMiniMap(nodes, pos, canvasWidth, canvasHeight, wrap) {
     const box = document.createElement("div");
     box.className = "cg-branch-mini-map";
-    box.innerHTML = "<div class='cg-branch-mini-title'>Mini Map</div>";
+    box.innerHTML = "<div class='cg-branch-mini-title'>Mini Map</div><div class='cg-branch-mini-tip'>点击或拖动视口快速定位</div>";
 
     const stage = document.createElement("div");
     stage.className = "cg-branch-mini-stage";
-    const scale = Math.min(130 / canvasWidth, 86 / canvasHeight);
+    const stageWidth = 206;
+    const stageHeight = 120;
+    const scale = Math.min(stageWidth / Math.max(1, canvasWidth), stageHeight / Math.max(1, canvasHeight));
 
     nodes.forEach((node) => {
       const p = pos[node.id];
@@ -1787,10 +1789,16 @@
       const dot = document.createElement("button");
       dot.type = "button";
       dot.className = "cg-branch-mini-dot";
+      const miniW = Math.max(10, Math.round(MAP_LAYOUT.cardWidth * scale));
+      const miniH = Math.max(7, Math.round(MAP_LAYOUT.cardHeight * scale));
       dot.style.left = `${Math.round(p.x * scale)}px`;
       dot.style.top = `${Math.round(p.y * scale)}px`;
+      dot.style.width = `${miniW}px`;
+      dot.style.height = `${miniH}px`;
+      dot.dataset.role = node.role || "assistant";
       if (node.id === appState.selectedNodeId) dot.dataset.selected = "true";
-      dot.title = node.title;
+      dot.title = `${node.role === "user" ? "你说" : "ChatGPT"}：${node.title}`;
+      dot.textContent = String(nodes.indexOf(node) + 1);
       dot.onclick = () => {
         wrap.scrollTo({
           left: Math.max(0, p.x - wrap.clientWidth / 2 + MAP_LAYOUT.cardWidth / 2),
@@ -1804,14 +1812,52 @@
     const viewport = document.createElement("div");
     viewport.className = "cg-branch-mini-viewport";
     const update = () => {
-      viewport.style.width = `${Math.max(18, wrap.clientWidth * scale)}px`;
-      viewport.style.height = `${Math.max(14, wrap.clientHeight * scale)}px`;
+      viewport.style.width = `${Math.max(26, wrap.clientWidth * scale)}px`;
+      viewport.style.height = `${Math.max(20, wrap.clientHeight * scale)}px`;
       viewport.style.left = `${wrap.scrollLeft * scale}px`;
       viewport.style.top = `${wrap.scrollTop * scale}px`;
     };
     update();
     wrap.onscroll = () => update();
     stage.appendChild(viewport);
+
+    stage.onclick = (event) => {
+      if (event.target && event.target.classList && event.target.classList.contains("cg-branch-mini-dot")) return;
+      const rect = stage.getBoundingClientRect();
+      const x = event.clientX - rect.left;
+      const y = event.clientY - rect.top;
+      const canvasX = x / scale;
+      const canvasY = y / scale;
+      wrap.scrollTo({
+        left: Math.max(0, canvasX - wrap.clientWidth / 2),
+        top: Math.max(0, canvasY - wrap.clientHeight / 2),
+        behavior: "smooth"
+      });
+    };
+
+    let draggingViewport = false;
+    viewport.onpointerdown = (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      draggingViewport = true;
+      viewport.setPointerCapture(event.pointerId);
+    };
+    viewport.onpointermove = (event) => {
+      if (!draggingViewport) return;
+      const rect = stage.getBoundingClientRect();
+      const x = clamp(event.clientX - rect.left, 0, rect.width);
+      const y = clamp(event.clientY - rect.top, 0, rect.height);
+      const canvasX = x / scale;
+      const canvasY = y / scale;
+      wrap.scrollTo({
+        left: Math.max(0, canvasX - wrap.clientWidth / 2),
+        top: Math.max(0, canvasY - wrap.clientHeight / 2),
+        behavior: "auto"
+      });
+    };
+    const stopDrag = () => { draggingViewport = false; };
+    viewport.onpointerup = stopDrag;
+    viewport.onpointercancel = stopDrag;
 
     box.appendChild(stage);
     return box;

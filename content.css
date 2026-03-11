@@ -685,7 +685,7 @@
 
 .cg-branch-mini-map {
   align-self: flex-end;
-  width: 150px;
+  width: 220px;
   border: 1px solid rgba(84, 122, 173, 0.25);
   border-radius: 10px;
   padding: 6px;
@@ -696,36 +696,59 @@
   font-size: 11px;
   font-weight: 700;
   color: #526280;
+  margin-bottom: 2px;
+}
+
+.cg-branch-mini-tip {
+  font-size: 10px;
+  color: #6a7c98;
   margin-bottom: 4px;
 }
 
 .cg-branch-mini-stage {
   position: relative;
-  width: 136px;
-  height: 90px;
+  width: 206px;
+  height: 120px;
   border-radius: 8px;
   background: rgba(93, 126, 180, 0.08);
+  overflow: hidden;
+  cursor: crosshair;
 }
 
 .cg-branch-mini-dot {
   position: absolute;
-  width: 8px;
-  height: 8px;
+  min-width: 10px;
+  min-height: 7px;
   border: 0;
-  border-radius: 999px;
+  border-radius: 4px;
   background: #3677d8;
   padding: 0;
   cursor: pointer;
+  color: #fff;
+  font-size: 8px;
+  font-weight: 700;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+  opacity: 0.9;
 }
 
-.cg-branch-mini-dot[data-selected="true"] { background: #1caa9f; }
+.cg-branch-mini-dot[data-role="user"] {
+  background: #6c63dc;
+}
+
+.cg-branch-mini-dot[data-selected="true"] {
+  background: #1caa9f;
+  outline: 1px solid rgba(255, 255, 255, 0.9);
+}
 
 .cg-branch-mini-viewport {
   position: absolute;
-  border: 1px solid rgba(31, 87, 172, 0.55);
+  border: 1px solid rgba(31, 87, 172, 0.85);
   border-radius: 4px;
-  pointer-events: none;
-  background: rgba(51, 102, 186, 0.1);
+  background: rgba(51, 102, 186, 0.16);
+  cursor: move;
 }
 
 .cg-branch-tag-btn {
