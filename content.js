@@ -519,7 +519,9 @@
   function autoTitle(text, role) {
     const lines = String(text || "").split("\n").map((l) => cleanText(l)).filter(Boolean);
     if (!lines.length) return role === "user" ? "用户提问" : "助手回复";
-    const main = (lines.find((l) => !l.startsWith("```")) || lines[0]).replace(/^[-*#>\d.\s]+/, "");
+    const main = (lines.find((l) => !l.startsWith("```")) || lines[0])
+      .replace(/^[-*#>\d.\s]+/, "")
+      .replace(/^(你说|ChatGPT\s*说|ChatGPT)\s*[:：]\s*/i, "");
     const t = cleanText(main) || (role === "user" ? "用户提问" : "助手回复");
     return t.length > 32 ? `${t.slice(0, 32)}...` : t;
   }
@@ -569,17 +571,18 @@
   }
 
   async function autoBuildTree() {
-    const messages = cachedMessages.length ? cachedMessages : findMessages();
+    const messages = getNavigationMessages();
     if (!messages.length) {
       showToast("没有扫描到可用消息。");
       return;
     }
-    if (!window.confirm("自动建树会重建当前会话图谱，是否继续？")) return;
 
     const nodes = [];
     let parentId = null;
+    let createdIndex = 0;
     messages.forEach((message) => {
-      const id = `auto_${message.index}_${Math.random().toString(36).slice(2, 6)}`;
+      const id = `auto_${createdIndex}_${Math.random().toString(36).slice(2, 6)}`;
+      createdIndex += 1;
       nodes.push({
         id,
         parentId,
@@ -589,9 +592,9 @@
         role: message.role,
         type: detectNodeType(message.text, message.role),
         title: autoTitle(message.text, message.role),
-        snippet: message.text.slice(0, 180),
+        snippet: cleanText(message.text).slice(0, 180),
         fullText: message.text.slice(0, 2000),
-        createdAt: new Date().toISOString(),
+        createdAt: new Date(Date.now() + createdIndex).toISOString(),
         missing: false,
         collapsed: false,
         position: null
@@ -603,7 +606,7 @@
     appState.selectedNodeId = nodes[nodes.length - 1].id;
     await saveState();
     render();
-    showToast("已自动构建基础树。");
+    showToast(`已自动建树：${nodes.length} 个节点。`);
   }
 
   function getDescendantSet(nodes, nodeId, set = new Set()) {
