@@ -859,10 +859,8 @@
     };
     branchOpening = true;
     try {
-      const preOpenedWindow = window.open("about:blank", "_blank", "noopener,noreferrer");
-      const started = await triggerNativeBranch(baseMessage, preOpenedWindow);
+      const started = await triggerNativeBranch(baseMessage);
       if (!started) {
-        if (preOpenedWindow && !preOpenedWindow.closed) preOpenedWindow.close();
         showToast("未找到“新聊天中的分支”入口，ChatGPT 页面结构可能已变化。");
         return;
       }
@@ -950,7 +948,7 @@
     return cachedMessages[idx] || cachedMessages[cachedMessages.length - 1];
   }
 
-  async function triggerNativeBranch(message, preOpenedWindow = null) {
+  async function triggerNativeBranch(message) {
     if (!message || !message.element) {
       return false;
     }
@@ -961,44 +959,15 @@
       if (!item) return false;
       const anchor = item.closest("a[href]") || item.querySelector?.("a[href]");
       if (anchor && anchor.href) {
-        if (preOpenedWindow && !preOpenedWindow.closed) {
-          preOpenedWindow.location.assign(anchor.href);
-        } else {
-          const opened = window.open(anchor.href, "_blank", "noopener,noreferrer");
-          if (!opened) {
-            // popup 被拦截时回退到当前页跳转
-            location.assign(anchor.href);
-          }
+        const opened = window.open(anchor.href, "_blank", "noopener,noreferrer");
+        if (!opened) {
+          // popup 被拦截时回退到当前页跳转
+          location.assign(anchor.href);
         }
         return true;
       }
-      let capturedUrl = "";
-      const originalOpen = window.open;
-      window.open = function patchedOpen(url, ...args) {
-        if (typeof url === "string" && url) {
-          capturedUrl = url;
-          if (preOpenedWindow && !preOpenedWindow.closed) {
-            preOpenedWindow.location.assign(url);
-            return preOpenedWindow;
-          }
-          const opened = originalOpen.call(window, url, "_blank", ...args);
-          if (!opened) {
-            location.assign(url);
-            return window;
-          }
-          return opened;
-        }
-        return originalOpen.apply(window, [url, ...args]);
-      };
-      try {
-        safeClick(item);
-      } finally {
-        window.open = originalOpen;
-      }
-      if (!capturedUrl && preOpenedWindow && !preOpenedWindow.closed) {
-        // 没有拿到 URL 时关闭预开页，避免留下 about:blank
-        preOpenedWindow.close();
-      }
+      // 无 href 时走 ChatGPT 原生分支逻辑
+      safeClick(item);
       return true;
     };
 
