@@ -64,7 +64,7 @@
       liteOpen: true,
       liteDock: { x: null, y: 180, side: "right" },
       compactDock: { x: null, y: 84, side: "right" },
-      panelDock: { x: null, y: 84 },
+      panelDock: { x: null, y: 84, side: "right" },
       autoRefresh: true,
       minimalMode: false,
       searchQuery: "",
@@ -92,10 +92,11 @@
     if (!(Number.isFinite(appState.compactDock.x) || appState.compactDock.x === null)) appState.compactDock.x = null;
     if (!Number.isFinite(appState.compactDock.y)) appState.compactDock.y = 84;
     if (!appState.panelDock || typeof appState.panelDock !== "object") {
-      appState.panelDock = { x: null, y: 84 };
+      appState.panelDock = { x: null, y: 84, side: "right" };
     }
     if (!(Number.isFinite(appState.panelDock.x) || appState.panelDock.x === null)) appState.panelDock.x = null;
     if (!Number.isFinite(appState.panelDock.y)) appState.panelDock.y = 84;
+    if (!["left", "right"].includes(appState.panelDock.side)) appState.panelDock.side = "right";
     if (typeof appState.autoRefresh !== "boolean") appState.autoRefresh = true;
     if (!appState.panel) appState.panel = { width: 380, height: 500 };
     appState.panel.width = clamp(Number(appState.panel.width) || 380, PANEL.minWidth, PANEL.maxWidth);
@@ -1265,6 +1266,8 @@
     rootEl.style.right = "";
     if (x !== null) {
       rootEl.style.left = `${x}px`;
+    } else if (appState.panelDock.side === "left") {
+      rootEl.style.left = "12px";
     } else {
       rootEl.style.right = "18px";
     }
@@ -1296,14 +1299,25 @@
             rootEl.style.right = "";
           },
           end() {
-            appState.panelDock.x = x;
+            const centerX = x + appState.panel.width / 2;
+            const snapSide = centerX < window.innerWidth / 2 ? "left" : "right";
+            appState.panelDock.side = snapSide;
+            appState.panelDock.x = null;
             appState.panelDock.y = y;
-            void saveState().catch((error) => handleContextError(error));
+            void saveState().then(() => render()).catch((error) => handleContextError(error));
           }
         }
       });
       titleEl._cgInteract = api;
     }
+
+    titleEl.ondblclick = async () => {
+      appState.panelDock.side = "right";
+      appState.panelDock.x = null;
+      appState.panelDock.y = 84;
+      await saveState();
+      render();
+    };
   }
 
   function installCompactDockDrag(dragHandleEl) {
