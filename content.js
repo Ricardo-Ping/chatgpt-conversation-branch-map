@@ -1565,8 +1565,26 @@
       showToast("该消息当前不可见。");
       return;
     }
-    message.element.scrollIntoView({ behavior: "smooth", block: "center" });
+    scrollElementToStart(message.element);
     flashMessage(message.element);
+  }
+
+  function scrollElementToStart(element) {
+    if (!element) return;
+    const container = getChatScrollContainer();
+    const topOffset = 18;
+    if (container === window) {
+      const rect = element.getBoundingClientRect();
+      const absoluteTop = window.scrollY + rect.top;
+      const targetTop = Math.max(0, absoluteTop - topOffset);
+      window.scrollTo({ top: targetTop, behavior: "smooth" });
+      return;
+    }
+    const containerRect = container.getBoundingClientRect();
+    const elementRect = element.getBoundingClientRect();
+    const relativeTop = container.scrollTop + (elementRect.top - containerRect.top);
+    const targetTop = Math.max(0, relativeTop - topOffset);
+    container.scrollTo({ top: targetTop, behavior: "smooth" });
   }
 
   function installResizeHandles() {
@@ -2053,7 +2071,7 @@
       return;
     }
 
-    target.scrollIntoView({ behavior: "smooth", block: "center" });
+    scrollElementToStart(target);
     flashMessage(target);
   }
 
