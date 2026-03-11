@@ -230,7 +230,7 @@
 
 .cg-branch-map-root[data-minimal="true"] {
   width: 84px !important;
-  height: 352px !important;
+  height: auto !important;
   border-radius: 14px;
 }
 
