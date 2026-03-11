@@ -730,8 +730,8 @@
 
 .cg-branch-tag-btn {
   position: absolute;
-  top: 10px;
-  left: 10px;
+  top: 6px;
+  left: -86px;
   right: auto;
   z-index: 5;
   padding: 6px 10px;

@@ -401,6 +401,16 @@
 
   function getButtonHost(messageEl) {
     if (!messageEl) return null;
+    if (messageEl.matches && messageEl.matches("[data-message-author-role]")) {
+      return messageEl;
+    }
+    const roleBox = messageEl.querySelector && messageEl.querySelector("[data-message-author-role]");
+    if (roleBox) return roleBox;
+    const prose = messageEl.querySelector && messageEl.querySelector(".markdown, [class*='prose'], [data-message-content]");
+    if (prose) {
+      const proseRole = prose.closest && prose.closest("[data-message-author-role]");
+      return proseRole || prose;
+    }
     const article = messageEl.closest("article");
     return article || messageEl;
   }
