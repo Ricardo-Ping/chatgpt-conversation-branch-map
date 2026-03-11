@@ -24,10 +24,12 @@
   let mapRuntime = null;
   let cachedMessages = [];
   let suppressObserver = false;
+  let lifecycleTimer = null;
 
-  boot();
+  boot().catch((error) => handleContextError(error));
 
   async function boot() {
+    if (!isExtensionContextAlive()) return;
     await loadState();
     normalizeState();
     ensureRoot();
@@ -36,9 +38,18 @@
     await maybeApplyReturnTarget();
     installObserver();
     window.addEventListener("popstate", handleLocationMaybeChanged);
-    setInterval(() => {
-      handleLocationMaybeChanged();
-      handleBranchLifecycle();
+    lifecycleTimer = setInterval(() => {
+      if (!isExtensionContextAlive()) {
+        if (lifecycleTimer) clearInterval(lifecycleTimer);
+        lifecycleTimer = null;
+        return;
+      }
+      try {
+        handleLocationMaybeChanged();
+        void handleBranchLifecycle().catch((error) => handleContextError(error));
+      } catch (error) {
+        handleContextError(error);
+      }
     }, 1000);
   }
 
@@ -94,34 +105,71 @@
   function getStorageKey() { return `${STORAGE_PREFIX}:${conversationId}`; }
 
   function handleLocationMaybeChanged() {
+    if (!isExtensionContextAlive()) return;
     if (location.pathname === lastPathname) return;
     lastPathname = location.pathname;
     conversationId = getConversationId();
-    loadState().then(() => {
+    void (async () => {
+      await loadState();
       normalizeState();
       ensureRoot();
       scanMessages();
-      handleBranchLifecycle().then(() => {
-        maybeApplyReturnTarget().then(() => render());
-      });
-    });
+      await handleBranchLifecycle();
+      await maybeApplyReturnTarget();
+      render();
+    })().catch((error) => handleContextError(error));
   }
 
   async function loadState() {
-    const stored = await chrome.storage.local.get(getStorageKey());
+    const stored = await safeStorageGet(getStorageKey());
     appState = stored[getStorageKey()] || createEmptyState();
   }
 
   async function saveState() {
-    await chrome.storage.local.set({ [getStorageKey()]: appState });
+    await safeStorageSet({ [getStorageKey()]: appState });
   }
 
   async function getGlobalStorage(keys) {
-    return chrome.storage.local.get(keys);
+    return safeStorageGet(keys);
   }
 
   async function setGlobalStorage(obj) {
-    return chrome.storage.local.set(obj);
+    return safeStorageSet(obj);
+  }
+
+  function isExtensionContextAlive() {
+    return typeof chrome !== "undefined" && Boolean(chrome.runtime && chrome.runtime.id && chrome.storage && chrome.storage.local);
+  }
+
+  function isContextInvalidatedError(error) {
+    const text = String((error && (error.message || error)) || "");
+    return /Extension context invalidated|Receiving end does not exist|The message port closed before/i.test(text);
+  }
+
+  function handleContextError(error) {
+    if (isContextInvalidatedError(error)) {
+      return;
+    }
+    console.error("[cg-branch-map] unexpected error", error);
+  }
+
+  async function safeStorageGet(keys) {
+    if (!isExtensionContextAlive()) return {};
+    try {
+      return await chrome.storage.local.get(keys);
+    } catch (error) {
+      handleContextError(error);
+      return {};
+    }
+  }
+
+  async function safeStorageSet(obj) {
+    if (!isExtensionContextAlive()) return;
+    try {
+      await chrome.storage.local.set(obj);
+    } catch (error) {
+      handleContextError(error);
+    }
   }
 
   function ensureRoot() {
