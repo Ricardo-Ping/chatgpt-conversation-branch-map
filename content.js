@@ -274,11 +274,40 @@
 
   function cleanText(text) { return String(text || "").replace(/\s+/g, " ").trim(); }
 
-  function readMessageText(el) {
+  function hasMediaPayload(el) {
+    if (!el || !el.querySelectorAll) return false;
+    const mediaNodes = el.querySelectorAll("figure,img,video,canvas,[data-testid*='attachment' i],[data-testid*='image' i]");
+    for (const node of mediaNodes) {
+      if (!node || (node.closest && node.closest(`#${ROOT_ID}`))) continue;
+      if (node.classList && (node.classList.contains("avatar") || node.classList.contains("cg-branch-tag-btn"))) continue;
+      const testId = (node.getAttribute && node.getAttribute("data-testid")) || "";
+      if (testId && /avatar|composer|profile/i.test(testId)) continue;
+      const rect = node.getBoundingClientRect ? node.getBoundingClientRect() : null;
+      const width = rect ? rect.width : 0;
+      const height = rect ? rect.height : 0;
+      if (node.tagName === "IMG") {
+        const src = node.getAttribute("src") || "";
+        const alt = (node.getAttribute("alt") || "").toLowerCase();
+        if (/avatar|profile/.test(src) || /avatar|profile/.test(alt)) continue;
+      }
+      if (width >= 60 && height >= 40) return true;
+      if (node.tagName === "FIGURE" || node.tagName === "VIDEO" || node.tagName === "CANVAS") return true;
+    }
+    return false;
+  }
+
+  function readMessageText(el, roleHint) {
     if (!el) return "";
     const cloned = el.cloneNode(true);
     cloned.querySelectorAll(".cg-branch-tag-btn").forEach((btn) => btn.remove());
-    return cleanText(cloned.innerText || cloned.textContent || "");
+    const text = cleanText(cloned.innerText || cloned.textContent || "");
+    if (text) return text;
+    if (hasMediaPayload(el)) {
+      if (roleHint === "user") return "图片提问";
+      if (roleHint === "assistant") return "图片回复";
+      return "图片消息";
+    }
+    return "";
   }
 
   function simpleHash(text) {
@@ -298,7 +327,7 @@
 
     candidates.forEach((el, index) => {
       const role = getRole(el) || (index % 2 === 0 ? "user" : "assistant");
-      const text = readMessageText(el);
+      const text = readMessageText(el, role);
       if (!text) return;
       const turnHost = el.closest && el.closest('article[data-testid^="conversation-turn-"],article[data-testid*="conversation-turn"]');
       const turnId = (turnHost && turnHost.getAttribute("data-testid")) || el.getAttribute("data-testid");
