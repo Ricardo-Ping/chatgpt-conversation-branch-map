@@ -14,6 +14,11 @@
   const VIEW_MODE = { MAP: "map", TREE: "tree" };
   const PANEL = { minWidth: 300, maxWidth: 760, minHeight: 260, maxHeight: 860 };
   const MAP_LAYOUT = { cardWidth: 220, cardHeight: 136, levelGap: 250, rowGap: 160, paddingX: 24, paddingY: 18 };
+  const LONG_CONV_KEEP_OPTIONS = [10, 20, 30];
+  const LONG_CONV_DEFAULT_KEEP = 10;
+  const LONG_CONV_DEFAULT_BUFFER = 10;
+  const LONG_CONV_AUTO_APPLY_DELAY = 220;
+  const LONG_CONV_AUTO_REOPT_DELAY = 220;
 
   let conversationId = getConversationId();
   let appState = createEmptyState();
@@ -29,6 +34,7 @@
   let pendingSearchFocus = null;
   let branchOpening = false;
   let liteViewportSyncCleanup = null;
+  let collapseRuntime = createCollapseRuntime();
 
   boot().catch((error) => handleContextError(error));
 
@@ -58,6 +64,32 @@
     }, 1000);
   }
 
+  function createCollapseRuntime() {
+    return {
+      isCollapsed: false,
+      hiddenEntries: [],
+      autoApplyTimer: null,
+      reoptTimer: null,
+      lastCollapsedAt: 0
+    };
+  }
+
+  function clearLongConvTimers() {
+    if (collapseRuntime.autoApplyTimer) {
+      clearTimeout(collapseRuntime.autoApplyTimer);
+      collapseRuntime.autoApplyTimer = null;
+    }
+    if (collapseRuntime.reoptTimer) {
+      clearTimeout(collapseRuntime.reoptTimer);
+      collapseRuntime.reoptTimer = null;
+    }
+  }
+
+  function resetCollapseRuntime() {
+    clearLongConvTimers();
+    collapseRuntime = createCollapseRuntime();
+  }
+
   function createEmptyState() {
     return {
       selectedNodeId: null,
@@ -71,6 +103,11 @@
       autoRefresh: true,
       minimalMode: false,
       searchQuery: "",
+      longConv: {
+        keepLatest: LONG_CONV_DEFAULT_KEEP,
+        autoEnabled: false,
+        autoBuffer: LONG_CONV_DEFAULT_BUFFER
+      },
       panel: { width: 380, height: 500 },
       nodes: []
     };
@@ -106,6 +143,17 @@
     appState.panel.height = clamp(Number(appState.panel.height) || 500, PANEL.minHeight, PANEL.maxHeight);
     if (typeof appState.searchQuery !== "string") appState.searchQuery = "";
     if (typeof appState.minimalMode !== "boolean") appState.minimalMode = false;
+    if (!appState.longConv || typeof appState.longConv !== "object") {
+      appState.longConv = {
+        keepLatest: LONG_CONV_DEFAULT_KEEP,
+        autoEnabled: false,
+        autoBuffer: LONG_CONV_DEFAULT_BUFFER
+      };
+    }
+    const keepLatest = Number(appState.longConv.keepLatest);
+    appState.longConv.keepLatest = LONG_CONV_KEEP_OPTIONS.includes(keepLatest) ? keepLatest : LONG_CONV_DEFAULT_KEEP;
+    appState.longConv.autoEnabled = Boolean(appState.longConv.autoEnabled);
+    appState.longConv.autoBuffer = LONG_CONV_DEFAULT_BUFFER;
     appState.nodes = appState.nodes.map((n) => ({
       ...n,
       collapsed: Boolean(n.collapsed),
@@ -127,6 +175,7 @@
     if (!isExtensionContextAlive()) return;
     if (location.pathname === lastPathname) return;
     lastPathname = location.pathname;
+    resetCollapseRuntime();
     conversationId = getConversationId();
     void (async () => {
       await loadState();
@@ -226,7 +275,7 @@
       if (suppressObserver) return;
       if (isOnlyPluginMutations(mutations)) return;
       clearTimeout(scanTimer);
-      scanTimer = setTimeout(scanMessages, 280);
+      scanTimer = setTimeout(() => scanMessages({ silent: true, reason: "observer" }), 280);
     });
     observer.observe(document.body, { childList: true, subtree: true });
   }
@@ -458,18 +507,325 @@
     return article || messageEl;
   }
 
-  function scanMessages() {
+  function getLongConvKeepLatest() {
+    const keepLatest = Number(appState?.longConv?.keepLatest);
+    return LONG_CONV_KEEP_OPTIONS.includes(keepLatest) ? keepLatest : LONG_CONV_DEFAULT_KEEP;
+  }
+
+  function getNextKeepLatest(currentKeep) {
+    const current = LONG_CONV_KEEP_OPTIONS.includes(currentKeep) ? currentKeep : LONG_CONV_DEFAULT_KEEP;
+    const index = LONG_CONV_KEEP_OPTIONS.indexOf(current);
+    return LONG_CONV_KEEP_OPTIONS[(index + 1) % LONG_CONV_KEEP_OPTIONS.length];
+  }
+
+  function getScrollTopValue(container) {
+    return container === window ? window.scrollY : container.scrollTop;
+  }
+
+  function setScrollTopValue(container, nextTop) {
+    const safeTop = Math.max(0, nextTop);
+    if (container === window) {
+      window.scrollTo({ top: safeTop, behavior: "auto" });
+      return;
+    }
+    container.scrollTop = safeTop;
+  }
+
+  function getElementTopInContainer(element, container) {
+    if (!element || !element.getBoundingClientRect) return 0;
+    const rect = element.getBoundingClientRect();
+    if (container === window) {
+      return window.scrollY + rect.top;
+    }
+    const containerRect = container.getBoundingClientRect();
+    return container.scrollTop + (rect.top - containerRect.top);
+  }
+
+  function chooseStableAnchorMessage(messages, hiddenKeySet = new Set()) {
+    if (!Array.isArray(messages) || !messages.length) return null;
+    const centerIndex = getCurrentViewportMessageIndex(messages);
+    if (!hiddenKeySet.has(messages[centerIndex]?.key)) return messages[centerIndex];
+
+    for (let step = 1; step < messages.length; step += 1) {
+      const left = centerIndex - step;
+      const right = centerIndex + step;
+      if (left >= 0 && !hiddenKeySet.has(messages[left].key)) return messages[left];
+      if (right < messages.length && !hiddenKeySet.has(messages[right].key)) return messages[right];
+    }
+    return null;
+  }
+
+  function captureScrollAnchor(messages, hiddenKeySet = new Set()) {
+    const container = getChatScrollContainer();
+    const anchorMessage = chooseStableAnchorMessage(messages, hiddenKeySet);
+    const snapshot = {
+      container,
+      scrollTopBefore: getScrollTopValue(container),
+      anchorElement: null,
+      anchorTopBefore: 0
+    };
+    if (anchorMessage && anchorMessage.element) {
+      snapshot.anchorElement = anchorMessage.element;
+      snapshot.anchorTopBefore = getElementTopInContainer(anchorMessage.element, container);
+    }
+    return snapshot;
+  }
+
+  function applyScrollAnchorCompensation(snapshot) {
+    if (!snapshot || !snapshot.container) return;
+    const { container, anchorElement, anchorTopBefore, scrollTopBefore } = snapshot;
+    if (!anchorElement || !anchorElement.isConnected) {
+      setScrollTopValue(container, scrollTopBefore);
+      return;
+    }
+    const anchorTopAfter = getElementTopInContainer(anchorElement, container);
+    const delta = anchorTopAfter - anchorTopBefore;
+    setScrollTopValue(container, scrollTopBefore + delta);
+  }
+
+  function buildNavigationGroupsFromMessages(messages) {
+    const groups = [];
+    const mergeMessage = (base, extra) => {
+      if (!base) return extra;
+      const combined = cleanText(`${base.text || ""}\n${extra.text || ""}`);
+      return {
+        ...base,
+        text: combined || base.text || extra.text || "",
+        snippet: cleanText(`${base.snippet || base.text || ""}\n${extra.snippet || extra.text || ""}`) || base.snippet || extra.snippet || ""
+      };
+    };
+    messages.forEach((message) => {
+      if (message.role === "user") {
+        const lastUserGroup = groups[groups.length - 1];
+        if (lastUserGroup && lastUserGroup.user && !lastUserGroup.assistant) {
+          lastUserGroup.user = mergeMessage(lastUserGroup.user, message);
+          return;
+        }
+        groups.push({ user: message, assistant: null });
+        return;
+      }
+      const last = groups[groups.length - 1];
+      if (last && last.user && !last.assistant) {
+        last.assistant = message;
+        return;
+      }
+      if (last && last.assistant && !last.user) {
+        last.assistant = mergeMessage(last.assistant, message);
+        return;
+      }
+      if (last && last.user && last.assistant) {
+        last.assistant = mergeMessage(last.assistant, message);
+        return;
+      }
+      groups.push({ user: null, assistant: message });
+    });
+    return groups;
+  }
+
+  function getVisibleConversationGroupCount(messages = null) {
+    const source = Array.isArray(messages) ? messages : (cachedMessages.length ? cachedMessages : findMessages());
+    return buildNavigationGroupsFromMessages(source).length;
+  }
+
+  async function collapseLongConversation(options = {}) {
+    const { manual = false, reason = "manual", suppressToast = false } = options;
+    const keepLatest = getLongConvKeepLatest();
+    const visibleMessages = findMessages();
+    cachedMessages = visibleMessages;
+    const visibleGroups = buildNavigationGroupsFromMessages(visibleMessages);
+
+    if (!visibleMessages.length || !visibleGroups.length) {
+      if (manual && !suppressToast) showToast("当前页面没有可收口的消息。");
+      return false;
+    }
+
+    const hiddenKeySet = new Set();
+    const hideMessageKeys = new Set();
+    const keepStartIndex = Math.max(0, visibleGroups.length - keepLatest);
+    const groupsToHide = visibleGroups.slice(0, keepStartIndex);
+    let remainGroups = visibleGroups.length - groupsToHide.length;
+    groupsToHide.forEach((group) => {
+      [group.user?.key, group.assistant?.key]
+        .filter(Boolean)
+        .forEach((key) => hideMessageKeys.add(key));
+    });
+    const toHide = visibleMessages.filter((message) => hideMessageKeys.has(message.key));
+    toHide.forEach((message) => hiddenKeySet.add(message.key));
+    const hiddenGroupCount = Math.max(0, groupsToHide.length);
+
+    if (!toHide.length) {
+      collapseRuntime.lastCollapsedAt = Date.now();
+      if (manual) {
+        appState.longConv.autoEnabled = true;
+        await saveState();
+        render();
+      }
+      if (!suppressToast && manual) {
+        showToast(`已开启自动收口，当前已是最近 ${Math.min(keepLatest, visibleGroups.length)} 组。`);
+      }
+      syncLongConversationAutomation();
+      return false;
+    }
+
+    const anchorSnapshot = captureScrollAnchor(visibleMessages, hiddenKeySet);
+    const hiddenEntries = [];
+    toHide.forEach((message) => {
+      const element = message.element;
+      const parent = element?.parentNode;
+      if (!element || !parent) return;
+      hiddenEntries.push({
+        element,
+        parent,
+        nextSibling: element.nextSibling,
+        key: message.key,
+        anchorId: message.anchorId
+      });
+      parent.removeChild(element);
+    });
+
+    if (!hiddenEntries.length) {
+      syncLongConversationAutomation();
+      return false;
+    }
+
+    collapseRuntime.hiddenEntries.push(...hiddenEntries);
+    collapseRuntime.isCollapsed = collapseRuntime.hiddenEntries.length > 0;
+    collapseRuntime.lastCollapsedAt = Date.now();
+
+    if (manual) {
+      appState.longConv.autoEnabled = true;
+      await saveState();
+    }
+
+    applyScrollAnchorCompensation(anchorSnapshot);
+    scanMessages({ silent: true, reason: `collapse:${reason}`, skipAutomation: true });
+    render();
+
+    if (!suppressToast) {
+      const overflow = Math.max(0, remainGroups - keepLatest);
+      if (overflow > 0) {
+        showToast(`已收口 ${hiddenGroupCount} 组（${hiddenEntries.length} 条消息），严格保留 ${keepLatest} 组。`);
+      } else {
+        showToast(`已收口 ${hiddenGroupCount} 组（${hiddenEntries.length} 条消息），当前保留 ${remainGroups} 组。`);
+      }
+    }
+
+    syncLongConversationAutomation();
+    return true;
+  }
+
+  async function restoreLongConversation(options = {}) {
+    const { clearAuto = true, suppressToast = false } = options;
+    if (!collapseRuntime.hiddenEntries.length) {
+      if (clearAuto && appState.longConv.autoEnabled) {
+        appState.longConv.autoEnabled = false;
+        await saveState();
+        render();
+      }
+      if (!suppressToast) showToast("当前没有已收口消息。");
+      syncLongConversationAutomation();
+      return false;
+    }
+
+    const visibleMessages = findMessages();
+    cachedMessages = visibleMessages;
+    const anchorSnapshot = captureScrollAnchor(visibleMessages);
+    const restoreEntries = collapseRuntime.hiddenEntries.slice().reverse();
+
+    restoreEntries.forEach((entry) => {
+      if (!entry?.element || !entry?.parent || !entry.parent.isConnected) return;
+      const anchor = entry.nextSibling && entry.nextSibling.parentNode === entry.parent ? entry.nextSibling : null;
+      entry.parent.insertBefore(entry.element, anchor);
+    });
+
+    const restoredCount = collapseRuntime.hiddenEntries.length;
+    collapseRuntime.hiddenEntries = [];
+    collapseRuntime.isCollapsed = false;
+    collapseRuntime.lastCollapsedAt = Date.now();
+    clearLongConvTimers();
+
+    if (clearAuto) {
+      appState.longConv.autoEnabled = false;
+    }
+    await saveState();
+
+    applyScrollAnchorCompensation(anchorSnapshot);
+    scanMessages({ silent: true, reason: "restore", skipAutomation: true });
+    render();
+
+    if (!suppressToast) {
+      showToast(clearAuto
+        ? `已恢复 ${restoredCount} 条消息，自动收口已关闭。`
+        : `已恢复 ${restoredCount} 条消息。`);
+    }
+    syncLongConversationAutomation();
+    return true;
+  }
+
+  function scheduleAutoCollapse(delayMs = LONG_CONV_AUTO_APPLY_DELAY) {
+    if (collapseRuntime.autoApplyTimer) clearTimeout(collapseRuntime.autoApplyTimer);
+    collapseRuntime.autoApplyTimer = setTimeout(() => {
+      collapseRuntime.autoApplyTimer = null;
+      void collapseLongConversation({ manual: false, reason: "auto", suppressToast: true }).catch((error) => handleContextError(error));
+    }, Math.max(80, Number(delayMs) || LONG_CONV_AUTO_APPLY_DELAY));
+  }
+
+  function scheduleAutoReoptimize(delayMs = LONG_CONV_AUTO_REOPT_DELAY) {
+    if (collapseRuntime.reoptTimer) clearTimeout(collapseRuntime.reoptTimer);
+    collapseRuntime.reoptTimer = setTimeout(() => {
+      collapseRuntime.reoptTimer = null;
+      void collapseLongConversation({ manual: false, reason: "reopt", suppressToast: true }).catch((error) => handleContextError(error));
+    }, Math.max(80, Number(delayMs) || LONG_CONV_AUTO_REOPT_DELAY));
+  }
+
+  function syncLongConversationAutomation() {
+    if (!appState?.longConv?.autoEnabled) {
+      clearLongConvTimers();
+      return;
+    }
+    const keepLatest = getLongConvKeepLatest();
+    const visibleMessages = cachedMessages.length ? cachedMessages : findMessages();
+    const visibleGroupsCount = getVisibleConversationGroupCount(visibleMessages);
+    collapseRuntime.isCollapsed = collapseRuntime.hiddenEntries.length > 0;
+
+    if (visibleGroupsCount > keepLatest) {
+      const elapsed = Date.now() - (collapseRuntime.lastCollapsedAt || 0);
+      const delay = elapsed >= 1800 ? LONG_CONV_AUTO_APPLY_DELAY : Math.max(LONG_CONV_AUTO_APPLY_DELAY, 1800 - elapsed);
+      if (collapseRuntime.isCollapsed) {
+        scheduleAutoReoptimize(delay);
+      } else {
+        scheduleAutoCollapse(delay);
+      }
+      return;
+    }
+
+    if (collapseRuntime.autoApplyTimer) {
+      clearTimeout(collapseRuntime.autoApplyTimer);
+      collapseRuntime.autoApplyTimer = null;
+    }
+    if (collapseRuntime.reoptTimer) {
+      clearTimeout(collapseRuntime.reoptTimer);
+      collapseRuntime.reoptTimer = null;
+    }
+  }
+
+  function scanMessages(options = {}) {
+    const { silent = false, reason = "manual", skipAutomation = false } = options;
     suppressObserver = true;
     cachedMessages = findMessages();
     injectTagButtons(cachedMessages);
     syncNodesWithMessages(cachedMessages);
-    if (!cachedMessages.length) {
-      showToast("未扫描到消息，请先打开一条有内容的对话。");
-    } else {
-      const questionCount = countQuestionMessages(cachedMessages);
-      showToast(`已扫描 ${cachedMessages.length} 条消息（提问 ${questionCount} 条）。`);
+    collapseRuntime.isCollapsed = collapseRuntime.hiddenEntries.length > 0;
+    if (!silent) {
+      if (!cachedMessages.length) {
+        showToast("未扫描到消息，请先打开一条有内容的对话。");
+      } else {
+        const questionCount = countQuestionMessages(cachedMessages);
+        showToast(`已扫描 ${cachedMessages.length} 条消息（提问 ${questionCount} 条）。`);
+      }
     }
     render();
+    if (!skipAutomation) syncLongConversationAutomation();
     setTimeout(() => { suppressObserver = false; }, 80);
   }
 
@@ -864,10 +1220,21 @@
       baseMessage = candidates[0].message;
     } else {
       node = getSelectedNode();
-      baseMessage = node ? getMessageFromNode(node) : getViewportMessage();
+      baseMessage = node ? getMessageFromNode(node) : null;
+      if (!baseMessage && node && collapseRuntime.isCollapsed) {
+        showToast("该节点消息已收口，请先恢复消息后再开分支。");
+        return;
+      }
+      if (!baseMessage) {
+        baseMessage = getViewportMessage();
+      }
     }
     if (!baseMessage) {
-      showToast("没有找到可用于开分支的消息。");
+      if (collapseRuntime.isCollapsed && appState.nodes.length) {
+        showToast("该节点消息已收口，请先恢复消息后再开分支。");
+      } else {
+        showToast("没有找到可用于开分支的消息。");
+      }
       return;
     }
 
@@ -1395,6 +1762,11 @@
     const title = document.createElement("div");
     title.className = "cg-lite-title";
     title.innerHTML = "<strong>问题栏</strong><span>快速定位提问点</span>";
+    const autoBadge = document.createElement("span");
+    autoBadge.className = "cg-lite-auto-badge";
+    autoBadge.dataset.enabled = appState.longConv.autoEnabled ? "true" : "false";
+    autoBadge.textContent = appState.longConv.autoEnabled ? "自动收口：开" : "自动收口：关";
+    title.appendChild(autoBadge);
 
     const actions = document.createElement("div");
     actions.className = "cg-lite-actions";
@@ -1410,6 +1782,48 @@
     branch.textContent = "开分支";
     branch.onclick = () => openBranchInCurrentTab();
 
+    const optimize = document.createElement("button");
+    optimize.type = "button";
+    optimize.className = "cg-lite-btn";
+    optimize.textContent = "优化";
+    optimize.onclick = () => {
+      void collapseLongConversation({ manual: true, reason: "manual" }).catch((error) => handleContextError(error));
+    };
+
+    const restore = document.createElement("button");
+    restore.type = "button";
+    restore.className = "cg-lite-btn cg-lite-btn-muted";
+    restore.textContent = "恢复";
+    restore.onclick = () => {
+      void restoreLongConversation({ clearAuto: true }).catch((error) => handleContextError(error));
+    };
+
+    const keep = document.createElement("button");
+    keep.type = "button";
+    keep.className = "cg-lite-btn cg-lite-btn-secondary";
+    keep.textContent = `保留${getLongConvKeepLatest()}组`;
+    keep.onclick = async () => {
+      const nextKeep = getNextKeepLatest(getLongConvKeepLatest());
+      appState.longConv.keepLatest = nextKeep;
+      await saveState();
+
+      if (collapseRuntime.hiddenEntries.length) {
+        await restoreLongConversation({ clearAuto: false, suppressToast: true });
+      }
+      const collapsed = await collapseLongConversation({ manual: false, reason: "keep-switch", suppressToast: true });
+      const visibleNowGroups = getVisibleConversationGroupCount();
+      render();
+      if (collapsed) {
+        showToast(`已切换保留 ${nextKeep} 组，并完成收口。`);
+        return;
+      }
+      if (visibleNowGroups > nextKeep) {
+        showToast(`已切换保留 ${nextKeep} 组，当前会话仍在加载历史消息。`);
+        return;
+      }
+      showToast(`已切换保留 ${nextKeep} 组，当前可见 ${visibleNowGroups} 组。`);
+    };
+
     const minimal = document.createElement("button");
     minimal.type = "button";
     minimal.className = "cg-lite-btn";
@@ -1419,7 +1833,7 @@
       await saveState();
       render();
     };
-    actions.append(refresh, branch, minimal);
+    actions.append(refresh, branch, optimize, restore, keep, minimal);
     head.append(title, actions);
     panel.appendChild(head);
 
@@ -1575,42 +1989,7 @@
 
   function getNavigationGroups() {
     const messages = getNavigationMessages();
-    const groups = [];
-    const mergeMessage = (base, extra) => {
-      if (!base) return extra;
-      const combined = cleanText(`${base.text || ""}\n${extra.text || ""}`);
-      return {
-        ...base,
-        text: combined || base.text || extra.text || "",
-        snippet: cleanText(`${base.snippet || base.text || ""}\n${extra.snippet || extra.text || ""}`) || base.snippet || extra.snippet || ""
-      };
-    };
-    messages.forEach((message) => {
-      if (message.role === "user") {
-        const lastUserGroup = groups[groups.length - 1];
-        if (lastUserGroup && lastUserGroup.user && !lastUserGroup.assistant) {
-          lastUserGroup.user = mergeMessage(lastUserGroup.user, message);
-          return;
-        }
-        groups.push({ user: message, assistant: null });
-        return;
-      }
-      const last = groups[groups.length - 1];
-      if (last && last.user && !last.assistant) {
-        last.assistant = message;
-        return;
-      }
-      if (last && last.assistant && !last.user) {
-        last.assistant = mergeMessage(last.assistant, message);
-        return;
-      }
-      if (last && last.user && last.assistant) {
-        last.assistant = mergeMessage(last.assistant, message);
-        return;
-      }
-      groups.push({ user: null, assistant: message });
-    });
-    return groups;
+    return buildNavigationGroupsFromMessages(messages);
   }
 
   function filterNavigationGroups(groups, rawQuery) {

@@ -78,11 +78,13 @@
   gap: 10px;
   padding: 10px;
   border-bottom: 1px solid rgba(88, 104, 133, 0.14);
+  align-items: flex-start;
 }
 
 .cg-lite-title {
   display: flex;
   flex-direction: column;
+  gap: 3px;
 }
 
 .cg-lite-title strong {
@@ -95,9 +97,31 @@
   color: #5d6c87;
 }
 
+.cg-lite-auto-badge {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  border: 1px solid rgba(83, 118, 171, 0.28);
+  background: rgba(58, 109, 182, 0.08);
+  color: #355a8f;
+}
+
+.cg-lite-auto-badge[data-enabled="true"] {
+  border-color: rgba(38, 177, 152, 0.45);
+  background: rgba(38, 177, 152, 0.14);
+  color: #196a61;
+}
+
 .cg-lite-actions {
   display: flex;
   gap: 6px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  max-width: 182px;
 }
 
 .cg-lite-btn,
@@ -111,6 +135,14 @@
   font-weight: 700;
   padding: 0 10px;
   height: 30px;
+}
+
+.cg-lite-btn-secondary {
+  background: linear-gradient(135deg, #3a7dc7, #2ab0a4);
+}
+
+.cg-lite-btn-muted {
+  background: linear-gradient(135deg, #4878bf, #5a91c6);
 }
 
 .cg-lite-quick {
