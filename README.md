@@ -104,7 +104,7 @@
 - `conversation-index-store.js`：按账号摘要隔离的本地最小会话索引
 - `conversation-manager.js`：会话读取、批量操作和管理弹窗
 - `content.css`：界面样式与动画
-- `lib/interact.min.js`：拖拽能力（interact.js）
+- 拖拽使用 `content.js` 内置的原生 Pointer Events 实现，不再加载第三方拖拽运行库
 - `docs/images/`：README 截图资源
 
 ## 测试

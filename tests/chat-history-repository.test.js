@@ -502,3 +502,54 @@ test("incremental project loading stops at an unchanged project page", async () 
   assert.equal(result.records.some((record) => record.id === "project-cached-old"), true);
   assert.equal(projectUrls.some((url) => url.includes("cursor=older-page")), false);
 });
+
+test("batch reports each confirmed result while retaining failures for retry", async () => {
+  const fixture = createFixtureFetch({
+    mutation({ id }) {
+      return id === "failed" ? jsonResponse({ success: false }) : emptyResponse();
+    }
+  });
+  const repository = createChatHistoryRepository({ fetchImpl: fixture.fetchImpl, sleep: async () => {} });
+  await repository.loadAll({ archiveState: "active" });
+  const events = [];
+  const result = await repository.runBatch({
+    action: "delete",
+    ids: ["ok", "failed"],
+    onItemResult(event) { events.push(event); }
+  });
+  assert.deepEqual(events.map((event) => `${event.id}:${event.status}`).sort(), ["failed:failed", "ok:succeeded"]);
+  assert.deepEqual(result.succeeded, ["ok"]);
+  assert.deepEqual(result.failed.map((item) => item.id), ["failed"]);
+});
+
+test("a 429 reduces subsequent batch dispatch to one worker before recovery", async () => {
+  const fixture = createFixtureFetch({
+    mutation({ id, attempt }) {
+      if (id === "rate-limited" && attempt === 1) return emptyResponse(429, { "retry-after": "0.001" });
+      return emptyResponse();
+    }
+  });
+  const repository = createChatHistoryRepository({ fetchImpl: fixture.fetchImpl, sleep: async () => {} });
+  await repository.loadAll({ archiveState: "active" });
+  const progress = [];
+  await repository.runBatch({
+    action: "archive",
+    ids: ["rate-limited", "other", "later"],
+    onProgress(update) { progress.push(update); }
+  });
+  assert.ok(progress.some((update) => update.completed > 0 && update.concurrency === 1));
+});
+
+test("project discovery is cached briefly without bypassing project or pin protection", async () => {
+  let clock = 1000;
+  const fixture = createFixtureFetch();
+  const repository = createChatHistoryRepository({ fetchImpl: fixture.fetchImpl, sleep: async () => {}, now: () => clock });
+  await repository.loadAll({ archiveState: "active" });
+  await repository.loadAll({ archiveState: "active", mode: "validate" });
+  const sidebarCalls = fixture.calls.filter((call) => call.url.includes("/backend-api/gizmos/snorlax/sidebar"));
+  assert.equal(sidebarCalls.length, 1);
+  assert.equal(fixture.calls.filter((call) => call.url.includes("/backend-api/pins")).length, 2);
+  clock += 5 * 60 * 1000 + 1;
+  await repository.loadAll({ archiveState: "active", mode: "validate" });
+  assert.equal(fixture.calls.filter((call) => call.url.includes("/backend-api/gizmos/snorlax/sidebar")).length, 2);
+});

@@ -112,3 +112,28 @@ test("surfaces storage quota failures without mutating the caller's records", as
   await assert.rejects(store.write("account-a", "active", { records }), /quota/i);
   assert.deepEqual(records, [{ id: "one", title: "聊天一" }]);
 });
+
+test("coalesces confirmed mutations into one account-index write", async () => {
+  const storage = createMemoryStorage();
+  let writes = 0;
+  const originalSet = storage.set;
+  storage.set = async (entries) => {
+    writes += 1;
+    return originalSet(entries);
+  };
+  const store = createConversationIndexStore({ storage, cryptoImpl: webcrypto, now: () => 3000 });
+  await store.write("account-a", "active", {
+    records: [{ id: "one", title: "一" }, { id: "two", title: "二" }]
+  });
+  writes = 0;
+  const writer = store.createMutationWriter("account-a", {
+    schedule() { return null; },
+    cancel() {}
+  });
+  writer.push({ action: "archive", succeeded: ["one"], records: [{ id: "one", title: "一" }] });
+  writer.push({ action: "delete", succeeded: ["two"], records: [{ id: "two", title: "二" }] });
+  await writer.flush();
+  assert.equal(writes, 1);
+  assert.deepEqual((await store.read("account-a", "active")).records, []);
+  assert.deepEqual((await store.read("account-a", "archived")).records.map((record) => record.id), ["one"]);
+});

@@ -28,8 +28,23 @@
   let lastPathname = location.pathname;
   let mapRuntime = null;
   let cachedMessages = [];
+  let messageDomVersion = 0;
+  // Message parsing is intentionally cached by DOM element.  ChatGPT streams
+  // into the same article repeatedly, so cloning/extracting every article on
+  // every observer tick is needlessly expensive.
+  const messageParseCache = new WeakMap();
+  const dirtyMessageElements = new Set();
+  let messageRoot = null;
+  let cachedScrollContainer = null;
+  let viewportRuntime = null;
+  let cachedViewportMessageKey = null;
+  let cachedViewportMessageIndex = 0;
+  let lastRenderSignature = "";
+  let pendingSearchRenderTimer = null;
   let suppressObserver = false;
   let lifecycleTimer = null;
+  let routeMonitorTimer = null;
+  let branchLifecycleListenerInstalled = false;
   let errorGuardInstalled = false;
   let pendingSearchFocus = null;
   let branchOpening = false;
@@ -49,19 +64,60 @@
     await maybeApplyReturnTarget();
     installObserver();
     window.addEventListener("popstate", handleLocationMaybeChanged);
-    lifecycleTimer = setInterval(() => {
+    installBranchLifecycleListeners();
+    scheduleBranchLifecycleProbe();
+    // Chrome content scripts run in an isolated JS world, so wrapping the
+    // page's history methods alone cannot reliably observe ChatGPT SPA
+    // navigation.  Keep a cheap pathname-only guard; unlike the old loop it
+    // performs no storage or network reads.
+    routeMonitorTimer = setInterval(() => {
       if (!isExtensionContextAlive()) {
-        if (lifecycleTimer) clearInterval(lifecycleTimer);
-        lifecycleTimer = null;
+        clearInterval(routeMonitorTimer);
+        routeMonitorTimer = null;
         return;
       }
-      try {
-        handleLocationMaybeChanged();
-        void handleBranchLifecycle().catch((error) => handleContextError(error));
-      } catch (error) {
-        handleContextError(error);
-      }
+      handleLocationMaybeChanged();
     }, 1000);
+  }
+
+  function installBranchLifecycleListeners() {
+    if (branchLifecycleListenerInstalled) return;
+    branchLifecycleListenerInstalled = true;
+    if (typeof chrome !== "undefined" && chrome.storage?.onChanged) {
+      chrome.storage.onChanged.addListener((changes, areaName) => {
+        if (areaName !== "local" || !changes[GLOBAL_BRANCH_PENDING_KEY] && !changes[GLOBAL_BRANCH_LINEAGE_KEY]) return;
+        void handleBranchLifecycle().catch((error) => handleContextError(error));
+      });
+    }
+    // ChatGPT frequently changes routes with history APIs without emitting
+    // popstate.  A narrow route event removes the need for a global timer.
+    ["pushState", "replaceState"].forEach((name) => {
+      const original = history[name];
+      if (typeof original !== "function" || original._cgBranchWrapped) return;
+      const wrapped = function (...args) {
+        const result = original.apply(this, args);
+        window.dispatchEvent(new Event("cgn:routechange"));
+        return result;
+      };
+      wrapped._cgBranchWrapped = true;
+      history[name] = wrapped;
+    });
+    window.addEventListener("cgn:routechange", handleLocationMaybeChanged);
+  }
+
+  function cancelBranchLifecycleProbe() {
+    if (lifecycleTimer) {
+      clearTimeout(lifecycleTimer);
+      lifecycleTimer = null;
+    }
+  }
+
+  function scheduleBranchLifecycleProbe(delayMs = 450) {
+    cancelBranchLifecycleProbe();
+    lifecycleTimer = setTimeout(() => {
+      lifecycleTimer = null;
+      void handleBranchLifecycle().catch((error) => handleContextError(error));
+    }, Math.max(120, Number(delayMs) || 450));
   }
 
   function createCollapseRuntime() {
@@ -176,6 +232,15 @@
     if (location.pathname === lastPathname) return;
     lastPathname = location.pathname;
     resetCollapseRuntime();
+    cancelBranchLifecycleProbe();
+    if (pendingSearchRenderTimer) {
+      clearTimeout(pendingSearchRenderTimer);
+      pendingSearchRenderTimer = null;
+    }
+    cachedScrollContainer = null;
+    viewportRuntime = null;
+    dirtyMessageElements.clear();
+    lastRenderSignature = "";
     conversationId = getConversationId();
     void (async () => {
       await loadState();
@@ -184,6 +249,7 @@
       scanMessages();
       await handleBranchLifecycle();
       await maybeApplyReturnTarget();
+      installObserver();
       render();
     })().catch((error) => handleContextError(error));
   }
@@ -270,19 +336,68 @@
 
   function installObserver() {
     if (observer) observer.disconnect();
+    messageRoot = document.querySelector("main") || document.body;
     observer = new MutationObserver((mutations) => {
       if (!appState.autoRefresh) return;
       if (suppressObserver) return;
       if (isOnlyPluginMutations(mutations)) return;
+      markDirtyMessages(mutations);
       clearTimeout(scanTimer);
       scanTimer = setTimeout(() => scanMessages({ silent: true, reason: "observer" }), 280);
     });
-    observer.observe(document.body, { childList: true, subtree: true });
+    observer.observe(messageRoot, { childList: true, subtree: true, characterData: true });
+  }
+
+  function getMutationElement(node) {
+    if (!node) return null;
+    if (node.nodeType === 1) return node;
+    return node.parentElement || null;
+  }
+
+  function findMessageContainerFromNode(node) {
+    const el = getMutationElement(node);
+    if (!el || (el.closest && el.closest(`#${ROOT_ID}`))) return null;
+    let container = el.closest?.('[data-message-author-role],article[data-testid^="conversation-turn-"],article[data-testid*="conversation-turn"]') || null;
+    if (container?.hasAttribute("data-message-author-role")) {
+      let parent = container.parentElement?.closest?.("[data-message-author-role]") || null;
+      while (parent) {
+        container = parent;
+        parent = container.parentElement?.closest?.("[data-message-author-role]") || null;
+      }
+    }
+    return container;
+  }
+
+  function markDirtyMessages(mutations) {
+    mutations.forEach((mutation) => {
+      const target = findMessageContainerFromNode(mutation.target);
+      if (target) {
+        dirtyMessageElements.add(target);
+        messageParseCache.delete(target);
+      }
+      (mutation.addedNodes || []).forEach((node) => {
+        const container = findMessageContainerFromNode(node) || target;
+        if (container) {
+          dirtyMessageElements.add(container);
+          messageParseCache.delete(container);
+        }
+      });
+      // A removed article cannot be parsed, but its parent may still contain
+      // a surviving message whose turn id/occurrence changed.
+      (mutation.removedNodes || []).forEach(() => {
+        if (target) {
+          dirtyMessageElements.add(target);
+          messageParseCache.delete(target);
+        }
+      });
+    });
   }
 
   function isOnlyPluginMutations(mutations) {
     const hasNonPluginNode = (node) => {
-      if (!node || node.nodeType !== 1) return false;
+      if (!node) return false;
+      if (node.nodeType === 3) return Boolean(String(node.textContent || "").trim());
+      if (node.nodeType !== 1) return false;
       const el = node;
       if (el.id === ROOT_ID) return false;
       if (el.classList && Array.from(el.classList).some((cls) => cls.startsWith("cg-branch-") || cls.startsWith("cg-lite-"))) {
@@ -294,9 +409,14 @@
     };
 
     for (const mutation of mutations) {
-      if (mutation.target && mutation.target.nodeType === 1) {
-        const target = mutation.target;
-        if (target.closest && target.closest(`#${ROOT_ID}`)) continue;
+      if (mutation.type === "characterData") {
+        const target = getMutationElement(mutation.target);
+        if (target?.closest?.(`#${ROOT_ID}`)) continue;
+        return false;
+      }
+      if (mutation.target) {
+        const target = getMutationElement(mutation.target);
+        if (target?.closest?.(`#${ROOT_ID}`)) continue;
       }
       for (const node of mutation.addedNodes || []) {
         if (hasNonPluginNode(node)) return false;
@@ -346,17 +466,30 @@
   }
 
   function readMessageText(el, roleHint) {
-    if (!el) return "";
+    return getParsedMessage(el, roleHint).text;
+  }
+
+  function getParsedMessage(el, roleHint) {
+    if (!el) return { text: "", media: false, role: roleHint || null };
+    if (!dirtyMessageElements.has(el)) {
+      const cached = messageParseCache.get(el);
+      if (cached) return cached;
+    }
     const cloned = el.cloneNode(true);
     cloned.querySelectorAll(".cg-branch-tag-btn").forEach((btn) => btn.remove());
     const text = cleanText(cloned.innerText || cloned.textContent || "");
-    if (text) return text;
-    if (hasMediaPayload(el)) {
-      if (roleHint === "user") return "图片提问";
-      if (roleHint === "assistant") return "图片回复";
-      return "图片消息";
-    }
-    return "";
+    const media = !text && hasMediaPayload(el);
+    const role = roleHint || getRole(el);
+    const result = {
+      text: text || (media
+        ? (role === "user" ? "图片提问" : (role === "assistant" ? "图片回复" : "图片消息"))
+        : ""),
+      media,
+      role
+    };
+    messageParseCache.set(el, result);
+    dirtyMessageElements.delete(el);
+    return result;
   }
 
   function simpleHash(text) {
@@ -375,8 +508,9 @@
     const seenTurnIds = new Set();
 
     candidates.forEach((el, index) => {
-      const role = getRole(el) || (index % 2 === 0 ? "user" : "assistant");
-      let text = readMessageText(el, role);
+      const parsed = getParsedMessage(el);
+      const role = parsed.role || (index % 2 === 0 ? "user" : "assistant");
+      let text = parsed.text;
       if (!text && hasMediaPayload(el)) {
         text = role === "user" ? "图片提问" : (role === "assistant" ? "图片回复" : "图片消息");
       }
@@ -476,8 +610,8 @@
     if (!container.closest("main")) return null;
     if (!container || (container.closest && container.closest(`#${ROOT_ID}`))) return null;
     if (!isElementActuallyVisible(container)) return null;
-    const roleHint = getRole(container);
-    const text = readMessageText(container, roleHint);
+    const parsed = getParsedMessage(container);
+    const text = parsed.text;
     if (!text && !hasMediaPayload(container)) return null;
     return container;
   }
@@ -812,7 +946,14 @@
   function scanMessages(options = {}) {
     const { silent = false, reason = "manual", skipAutomation = false } = options;
     suppressObserver = true;
-    cachedMessages = findMessages();
+    const liveMessageRoot = document.querySelector("main") || document.body;
+    if (observer && liveMessageRoot !== messageRoot) installObserver();
+    cachedScrollContainer = null;
+    const nextMessages = findMessages();
+    const domIdentityChanged = nextMessages.length !== cachedMessages.length
+      || nextMessages.some((message, index) => message.element !== cachedMessages[index]?.element);
+    if (domIdentityChanged) messageDomVersion += 1;
+    cachedMessages = nextMessages;
     injectTagButtons(cachedMessages);
     syncNodesWithMessages(cachedMessages);
     collapseRuntime.isCollapsed = collapseRuntime.hiddenEntries.length > 0;
@@ -1296,9 +1437,11 @@
       const global = await getGlobalStorage([GLOBAL_BRANCH_PENDING_KEY, GLOBAL_BRANCH_LINEAGE_KEY]);
       const pending = global[GLOBAL_BRANCH_PENDING_KEY];
       if (!pending) {
+        cancelBranchLifecycleProbe();
         return;
       }
       if (pending.expiresAt && Date.now() > new Date(pending.expiresAt).getTime()) {
+        cancelBranchLifecycleProbe();
         await setGlobalStorage({ [GLOBAL_BRANCH_PENDING_KEY]: null });
         showToast("分支创建超时，请重试“开分支”。");
         return;
@@ -1306,6 +1449,7 @@
 
       if (pending.status === "awaiting_child_url") {
         if (conversationId === "temporary-chat" || conversationId === pending.sourceConversationId) {
+          scheduleBranchLifecycleProbe();
           return;
         }
         const lineage = global[GLOBAL_BRANCH_LINEAGE_KEY] || {};
@@ -1320,6 +1464,8 @@
         });
         showToast("分支已在当前页创建，可随时返回父会话。");
       }
+      // A successful child handoff clears the pending record; storage change
+      // listener will perform the final no-op check without starting a timer.
     } catch (error) {
       handleContextError(error);
       if (isContextInvalidatedError(error)) {
@@ -1524,6 +1670,12 @@
 
   function render() {
     if (!rootEl) return;
+    const signature = getRenderSignature();
+    if (signature === lastRenderSignature && rootEl.firstChild) {
+      restorePendingSearchFocus();
+      return;
+    }
+    lastRenderSignature = signature;
 
     if (liteViewportSyncCleanup) {
       liteViewportSyncCleanup();
@@ -1857,7 +2009,7 @@
         start: Number.isFinite(inputEl.selectionStart) ? inputEl.selectionStart : null,
         end: Number.isFinite(inputEl.selectionEnd) ? inputEl.selectionEnd : null
       };
-      render();
+      scheduleSearchRender();
     });
     search.oninput = (event) => {
       const inputEl = event.target;
@@ -1868,7 +2020,7 @@
         start: Number.isFinite(inputEl.selectionStart) ? inputEl.selectionStart : null,
         end: Number.isFinite(inputEl.selectionEnd) ? inputEl.selectionEnd : null
       };
-      render();
+      scheduleSearchRender();
     };
     searchWrap.appendChild(search);
     panel.appendChild(searchWrap);
@@ -1952,43 +2104,120 @@
     if (!listEl) return;
     const rows = Array.from(listEl.querySelectorAll(".cg-lite-item"));
     if (!rows.length) return;
-    const rowByKey = new Map(rows.map((row) => [row.dataset.messageKey, row]));
-
+    const allMessages = getNavigationMessages();
+    const source = allMessages.filter((m) => m.role === "user");
+    const messages = source.length ? source : allMessages;
+    if (!messages.length) return;
     const container = getChatScrollContainer();
-    let rafId = 0;
+    const rowByKey = new Map(rows.map((row) => [row.dataset.messageKey, row]));
+    const messageByElement = new Map(messages.map((message) => [message.element, message]));
+    let previousRow = null;
+    let intersectionObserver = null;
 
-    const update = () => {
-      rafId = 0;
-      const source = getNavigationMessages().filter((m) => m.role === "user");
-      const messages = source.length ? source : getNavigationMessages();
-      if (!messages.length) return;
-      const currentIndex = getCurrentViewportMessageIndex(messages);
-      const current = messages[currentIndex];
-      rows.forEach((row) => row.classList.remove("cg-lite-item-current"));
-      if (current && rowByKey.has(current.key)) {
-        rowByKey.get(current.key).classList.add("cg-lite-item-current");
-      }
+    const setCurrent = (current) => {
+      if (!current) return;
+      cachedViewportMessageKey = current.key;
+      cachedViewportMessageIndex = Math.max(0, messages.indexOf(current));
+      const nextRow = rowByKey.get(current.key) || null;
+      if (nextRow === previousRow) return;
+      previousRow?.classList.remove("cg-lite-item-current");
+      nextRow?.classList.add("cg-lite-item-current");
+      previousRow = nextRow;
     };
 
-    const schedule = () => {
-      if (rafId) return;
-      rafId = requestAnimationFrame(update);
+    const candidates = new Map();
+    const updateFromEntries = (entries) => {
+      entries.forEach((entry) => {
+        if (entry.isIntersecting) candidates.set(entry.target, entry);
+        else candidates.delete(entry.target);
+      });
+      let best = null;
+      let bestDistance = Number.POSITIVE_INFINITY;
+      const rootRect = container === window ? { top: 0, height: window.innerHeight } : container.getBoundingClientRect();
+      const center = rootRect.top + rootRect.height / 2;
+      candidates.forEach((entry) => {
+        const rect = entry.boundingClientRect;
+        const distance = Math.abs(rect.top + rect.height / 2 - center);
+        if (distance < bestDistance) {
+          bestDistance = distance;
+          best = entry.target;
+        }
+      });
+      if (best) setCurrent(messageByElement.get(best));
     };
 
-    const onScroll = () => schedule();
-    container.addEventListener("scroll", onScroll, { passive: true });
-    window.addEventListener("resize", onScroll, { passive: true });
+    if (typeof IntersectionObserver === "function") {
+      intersectionObserver = new IntersectionObserver(updateFromEntries, {
+        root: container === window ? null : container,
+        rootMargin: "-35% 0px -35% 0px",
+        threshold: [0, 0.5, 1]
+      });
+      messages.forEach((message) => intersectionObserver.observe(message.element));
+    } else {
+      // Older browsers: do one bounded calculation at setup time.  Scroll
+      // events no longer trigger an O(message count) layout scan.
+      setCurrent(messages[cachedViewportMessageIndex] || messages[0]);
+    }
+
+    const onResize = () => {
+      cachedScrollContainer = null;
+      viewportRuntime?.refresh?.();
+    };
+    window.addEventListener("resize", onResize, { passive: true });
 
     liteViewportSyncCleanup = () => {
-      container.removeEventListener("scroll", onScroll);
-      window.removeEventListener("resize", onScroll);
-      if (rafId) {
-        cancelAnimationFrame(rafId);
-        rafId = 0;
-      }
+      window.removeEventListener("resize", onResize);
+      intersectionObserver?.disconnect();
+      if (viewportRuntime?.messages === messages) viewportRuntime = null;
     };
+    viewportRuntime = { messages, observer: intersectionObserver, refresh: () => {} };
+  }
 
-    schedule();
+  function getRenderSignature() {
+    const messageSignature = cachedMessages.map((message) => `${message.key}:${message.hash}`).join("|");
+    const nodeSignature = appState.nodes.map((node) => [
+      node.id,
+      node.messageKey,
+      node.messageHash,
+      node.title,
+      node.type,
+      Boolean(node.missing),
+      Boolean(node.collapsed),
+      node.position?.x || 0,
+      node.position?.y || 0
+    ].join(":")).join("|");
+    return [
+      conversationId,
+      appState.searchQuery,
+      appState.liteOpen,
+      appState.minimalMode,
+      appState.longConv?.autoEnabled,
+      appState.longConv?.keepLatest,
+      appState.selectedNodeId,
+      appState.nodes.length,
+      appState.liteDock?.side,
+      appState.liteDock?.x,
+      appState.liteDock?.y,
+      appState.compactDock?.side,
+      appState.compactDock?.x,
+      appState.compactDock?.y,
+      appState.panelDock?.side,
+      appState.panelDock?.x,
+      appState.panelDock?.y,
+      appState.panel?.width,
+      appState.panel?.height,
+      messageDomVersion,
+      nodeSignature,
+      messageSignature
+    ].join("\u0001");
+  }
+
+  function scheduleSearchRender() {
+    if (pendingSearchRenderTimer) clearTimeout(pendingSearchRenderTimer);
+    pendingSearchRenderTimer = setTimeout(() => {
+      pendingSearchRenderTimer = null;
+      render();
+    }, 90);
   }
 
   function getNavigationMessages() {
@@ -2173,6 +2402,32 @@
     installCompactDockDrag(dock);
   }
 
+  function installPointerDragFallback(handleEl, options) {
+    if (!handleEl || !options) return;
+    handleEl.onpointerdown = (event) => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      const origin = options.getPosition();
+      let moved = false;
+      handleEl.setPointerCapture?.(event.pointerId);
+      handleEl.classList.add("cg-branch-dragging");
+      const onMove = (moveEvent) => {
+        moved = moved || Math.abs(moveEvent.clientX - event.clientX) > 2 || Math.abs(moveEvent.clientY - event.clientY) > 2;
+        options.onMove(origin, moveEvent.clientX - event.clientX, moveEvent.clientY - event.clientY, moveEvent);
+      };
+      const onEnd = (endEvent) => {
+        handleEl.classList.remove("cg-branch-dragging");
+        handleEl.removeEventListener("pointermove", onMove);
+        handleEl.removeEventListener("pointerup", onEnd);
+        handleEl.removeEventListener("pointercancel", onEnd);
+        options.onEnd?.(origin, endEvent.clientX - event.clientX, endEvent.clientY - event.clientY, moved, endEvent);
+      };
+      handleEl.addEventListener("pointermove", onMove);
+      handleEl.addEventListener("pointerup", onEnd);
+      handleEl.addEventListener("pointercancel", onEnd);
+    };
+  }
+
   function applyCompactDockPosition() {
     rootEl.style.top = `${clamp(appState.compactDock.y, 12, Math.max(12, window.innerHeight - 80))}px`;
     const dockX = Number.isFinite(appState.compactDock.x)
@@ -2241,6 +2496,29 @@
         }
       });
       titleEl._cgInteract = api;
+    } else {
+      installPointerDragFallback(titleEl, {
+        getPosition: () => ({
+          x: clamp(rootEl.getBoundingClientRect().left, 8, Math.max(8, window.innerWidth - appState.panel.width - 8)),
+          y: clamp(rootEl.getBoundingClientRect().top, 12, Math.max(12, window.innerHeight - 80))
+        }),
+        onMove: (origin, dx, dy) => {
+          const x = clamp(origin.x + dx, 8, Math.max(8, window.innerWidth - appState.panel.width - 8));
+          const y = clamp(origin.y + dy, 12, Math.max(12, window.innerHeight - 80));
+          rootEl.style.left = `${x}px`;
+          rootEl.style.top = `${y}px`;
+          rootEl.style.right = "";
+        },
+        onEnd: (origin, dx, dy, moved) => {
+          if (!moved) return;
+          const x = clamp(origin.x + dx, 8, Math.max(8, window.innerWidth - appState.panel.width - 8));
+          const y = clamp(origin.y + dy, 12, Math.max(12, window.innerHeight - 80));
+          appState.panelDock.side = x + appState.panel.width / 2 < window.innerWidth / 2 ? "left" : "right";
+          appState.panelDock.x = null;
+          appState.panelDock.y = y;
+          void saveState().then(() => render()).catch((error) => handleContextError(error));
+        }
+      });
     }
 
     titleEl.ondblclick = async () => {
@@ -2282,6 +2560,28 @@
       dragHandleEl._cgInteract = api;
       return;
     }
+    installPointerDragFallback(dragHandleEl, {
+      getPosition: () => ({
+        x: clamp(rootEl.getBoundingClientRect().left, 8, Math.max(8, window.innerWidth - 96)),
+        y: clamp(rootEl.getBoundingClientRect().top, 8, Math.max(8, window.innerHeight - 80))
+      }),
+      onMove: (origin, dx, dy) => {
+        const x = clamp(origin.x + dx, 8, Math.max(8, window.innerWidth - 96));
+        const y = clamp(origin.y + dy, 8, Math.max(8, window.innerHeight - 80));
+        rootEl.style.left = `${x}px`;
+        rootEl.style.top = `${y}px`;
+        rootEl.style.right = "";
+      },
+      onEnd: (origin, dx, dy, moved) => {
+        if (!moved) return;
+        const x = clamp(origin.x + dx, 8, Math.max(8, window.innerWidth - 96));
+        const y = clamp(origin.y + dy, 8, Math.max(8, window.innerHeight - 80));
+        appState.compactDock.side = x + 48 < window.innerWidth / 2 ? "left" : "right";
+        appState.compactDock.y = clamp(y, 12, Math.max(12, window.innerHeight - 80));
+        appState.compactDock.x = null;
+        void saveState().then(() => render()).catch((error) => handleContextError(error));
+      }
+    });
   }
 
   function renderNavigatorBar() {
@@ -2404,28 +2704,17 @@
     if (!messages.length) {
       return 0;
     }
-    const container = getChatScrollContainer();
-    const centerY = container === window
-      ? window.scrollY + window.innerHeight / 2
-      : container.scrollTop + container.clientHeight / 2;
-    let bestIndex = 0;
-    let bestDistance = Number.MAX_SAFE_INTEGER;
-
-    messages.forEach((message, index) => {
-      const rect = message.element.getBoundingClientRect();
-      const absCenter = container === window
-        ? window.scrollY + rect.top + rect.height / 2
-        : container.scrollTop + (rect.top - container.getBoundingClientRect().top) + rect.height / 2;
-      const distance = Math.abs(absCenter - centerY);
-      if (distance < bestDistance) {
-        bestDistance = distance;
-        bestIndex = index;
-      }
-    });
-    return bestIndex;
+    if (cachedViewportMessageKey) {
+      const observedIndex = messages.findIndex((message) => message.key === cachedViewportMessageKey);
+      if (observedIndex >= 0) return observedIndex;
+    }
+    return clamp(cachedViewportMessageIndex, 0, messages.length - 1);
   }
 
   function getChatScrollContainer() {
+    if (cachedScrollContainer && (cachedScrollContainer === window || cachedScrollContainer.isConnected)) {
+      return cachedScrollContainer;
+    }
     const probe = cachedMessages[0] ? cachedMessages[0].element : null;
     if (probe) {
       let parent = probe.parentElement;
@@ -2433,7 +2722,8 @@
         const style = window.getComputedStyle(parent);
         const canScroll = /(auto|scroll)/.test(style.overflowY) && parent.scrollHeight > parent.clientHeight + 40;
         if (canScroll) {
-          return parent;
+          cachedScrollContainer = parent;
+          return cachedScrollContainer;
         }
         parent = parent.parentElement;
       }
@@ -2445,9 +2735,11 @@
     });
     if (candidates.length) {
       candidates.sort((a, b) => b.scrollHeight - a.scrollHeight);
-      return candidates[0];
+      cachedScrollContainer = candidates[0];
+      return cachedScrollContainer;
     }
-    return window;
+    cachedScrollContainer = window;
+    return cachedScrollContainer;
   }
 
   function scrollChatTo(target) {

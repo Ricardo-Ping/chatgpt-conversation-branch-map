@@ -50,22 +50,38 @@
       return cloneView(current.views[archiveState]);
     }
 
-    async function applyBatch(accountId, { action, succeeded, records }) {
-      const ids = new Set((succeeded || []).map(String));
-      if (!ids.size) return;
+    async function applyBatch(accountId, operation) {
+      return applyBatches(accountId, [operation]);
+    }
+
+    // Batch UI operations arrive one at a time, but chrome.storage writes the
+    // complete account namespace.  Applying a short burst together prevents a
+    // large account index from being read, sorted and written once per row.
+    async function applyBatches(accountId, operations) {
+      const validOperations = (operations || []).filter((operation) =>
+        operation && ["archive", "restore", "delete"].includes(operation.action)
+          && (operation.succeeded || []).some((id) => String(id))
+      );
+      if (!validOperations.length) return;
       const key = await accountKey(accountId);
       const stored = await storage.get(key);
       const bundle = isValidBundle(stored?.[key]) ? stored[key] : emptyBundle();
-      const selectedRecords = new Map((records || []).filter((record) => ids.has(record.id)).map((record) => [record.id, record]));
       const active = isValidView(bundle.views.active) ? bundle.views.active : emptyView();
       const archived = isValidView(bundle.views.archived) ? bundle.views.archived : emptyView();
 
-      active.records = active.records.filter((record) => !ids.has(record.id));
-      archived.records = archived.records.filter((record) => !ids.has(record.id));
-      if (action === "archive") {
-        archived.records.push(...[...selectedRecords.values()].map((record) => sanitizeRecord({ ...record, archived: true })));
-      } else if (action === "restore") {
-        active.records.push(...[...selectedRecords.values()].map((record) => sanitizeRecord({ ...record, archived: false })));
+      for (const { action, succeeded, records } of validOperations) {
+        const ids = new Set((succeeded || []).map(String));
+        if (!ids.size) continue;
+        const selectedRecords = new Map((records || [])
+          .filter((record) => ids.has(record.id))
+          .map((record) => [record.id, record]));
+        active.records = active.records.filter((record) => !ids.has(record.id));
+        archived.records = archived.records.filter((record) => !ids.has(record.id));
+        if (action === "archive") {
+          archived.records.push(...[...selectedRecords.values()].map((record) => sanitizeRecord({ ...record, archived: true })));
+        } else if (action === "restore") {
+          active.records.push(...[...selectedRecords.values()].map((record) => sanitizeRecord({ ...record, archived: false })));
+        }
       }
       active.syncedAt = now();
       archived.syncedAt = now();
@@ -73,6 +89,41 @@
       bundle.views.archived = sanitizeView(archived);
       bundle.lastAccessedAt = now();
       await storage.set({ [key]: bundle });
+    }
+
+    function createMutationWriter(accountId, { delay = 150, schedule = setTimeout, cancel = clearTimeout, onError = () => {} } = {}) {
+      let pending = [];
+      let timer = null;
+      let writing = Promise.resolve();
+
+      function drain() {
+        if (timer !== null) cancel(timer);
+        timer = null;
+        const operations = pending;
+        pending = [];
+        if (!operations.length) return writing;
+        writing = writing
+          .then(() => applyBatches(accountId, operations))
+          .catch((error) => {
+            onError(error);
+          });
+        return writing;
+      }
+
+      return Object.freeze({
+        push(operation) {
+          pending.push(operation);
+          if (timer === null) timer = schedule(drain, delay);
+        },
+        flush() {
+          return drain();
+        },
+        cancel() {
+          if (timer !== null) cancel(timer);
+          timer = null;
+          pending = [];
+        }
+      });
     }
 
     function emptyBundle() {
@@ -83,7 +134,7 @@
       return { records: [], syncedAt: 0, fullSyncedAt: 0, checkpoints: { main: null, projects: {} } };
     }
 
-    return Object.freeze({ accountKey, applyBatch, read, write });
+    return Object.freeze({ accountKey, applyBatch, applyBatches, createMutationWriter, read, write });
   }
 
   function sanitizeRecord(record) {

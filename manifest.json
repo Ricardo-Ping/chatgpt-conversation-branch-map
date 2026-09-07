@@ -17,7 +17,6 @@
         "https://chat.openai.com/*"
       ],
       "js": [
-        "lib/interact.min.js",
         "conversation-manager-core.js",
         "conversation-index-store.js",
         "conversation-manager.js",

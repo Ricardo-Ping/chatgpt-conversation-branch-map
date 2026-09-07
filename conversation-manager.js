@@ -15,6 +15,11 @@
   const PAGE_SIZE = 100;
   const PROJECT_PAGE_SIZE = 50;
   const MAX_PAGES = 500;
+  const MAX_REQUEST_CONCURRENCY = 3;
+  const INITIAL_BATCH_CONCURRENCY = 2;
+  const MAX_BATCH_CONCURRENCY = 3;
+  const PROJECT_DISCOVERY_TTL_MS = 5 * 60 * 1000;
+  const MUTATION_JOURNAL_TTL_MS = 2 * 60 * 1000;
   const CACHE_FRESH_MS = 2 * 60 * 1000;
   const LIST_BATCH_SIZE = 100;
   const ACTIVE_SCHEDULED_STATUSES = new Set(["active", "scheduled", "pending", "enabled"]);
@@ -31,6 +36,12 @@
     [core.TIME_FILTER.MONTH, "1 个月前"],
     [core.TIME_FILTER.HALF_YEAR, "半年前"]
   ];
+  const DATE_FORMATTER = new Intl.DateTimeFormat("zh-CN", {
+    year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit"
+  });
+  const SYNC_TIME_FORMATTER = new Intl.DateTimeFormat("zh-CN", {
+    month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit"
+  });
 
   class ChatHistoryError extends Error {
     constructor(message, status = 0, fatal = false) {
@@ -41,15 +52,16 @@
     }
   }
 
-  function createChatHistoryRepository({ fetchImpl = globalThis.fetch.bind(globalThis), sleep = wait } = {}) {
+  function createChatHistoryRepository({ fetchImpl = globalThis.fetch.bind(globalThis), sleep = wait, now = () => Date.now() } = {}) {
     let authContext = null;
     let activeAccountId = null;
     let mutationReady = false;
     let activeRequests = 0;
     const requestQueue = [];
+    const projectDiscoveryCache = new Map();
 
     function runQueuedRequests() {
-      while (activeRequests < 3 && requestQueue.length) {
+      while (activeRequests < MAX_REQUEST_CONCURRENCY && requestQueue.length) {
         const entry = requestQueue.shift();
         if (entry.signal?.aborted) {
           entry.reject(new DOMException("Aborted", "AbortError"));
@@ -105,15 +117,22 @@
       const warnings = [];
       onProgress({ phase: "list", loaded: 0, total: null, label: "正在读取聊天列表…" });
 
-      const standardResult = await loadConversationPages({
-        archived,
-        mode,
-        cachedRecords,
-        checkpoint: checkpoints?.main,
-        signal,
-        onProgress,
-        onPage
+      // Start every independent active-view source immediately.  The request
+      // queue still enforces one global cap, so this shortens round trips
+      // without multiplying traffic or weakening the compatibility checks.
+      const standardPromise = loadConversationPages({
+        archived, mode, cachedRecords, checkpoint: checkpoints?.main, signal, onProgress, onPage
       });
+      const activeChecks = !archived
+        ? [
+          loadProjectConversations({ mode, cachedRecords, checkpoints: checkpoints?.projects, signal, onProgress, onPage }),
+          loadPinnedConversations(signal)
+        ]
+        : [];
+      const sourceResults = await Promise.allSettled([standardPromise, ...activeChecks]);
+      const standardCheck = sourceResults[0];
+      if (standardCheck.status === "rejected") throw standardCheck.reason;
+      const standardResult = standardCheck.value;
       const standard = standardResult.rows;
       let pinnedConversations = [];
       let protectionVerified = archived;
@@ -122,10 +141,7 @@
       let pinnedIds = new Set();
       let canMutate = true;
       if (!archived) {
-        const checks = await Promise.allSettled([
-          loadProjectConversations({ mode, cachedRecords, checkpoints: checkpoints?.projects, signal, onProgress, onPage }),
-          loadPinnedConversations(signal)
-        ]);
+        const checks = sourceResults.slice(1);
         const labels = ["项目聊天", "置顶聊天"];
         for (let index = 0; index < checks.length; index += 1) {
           const check = checks[index];
@@ -215,7 +231,7 @@
       };
     }
 
-    async function runBatch({ action, ids, signal, onProgress = () => {} } = {}) {
+    async function runBatch({ action, ids, signal, onProgress = () => {}, onItemResult = () => {} } = {}) {
       if (!activeAccountId) throw new ChatHistoryError("尚未选择可用账号。", 0, true);
       if (!mutationReady) throw new ChatHistoryError("兼容性检查未通过，批量操作已被安全禁用。", 0, true);
       if (!["archive", "restore", "delete"].includes(action)) {
@@ -225,6 +241,10 @@
       const succeeded = [];
       const failed = [];
       let nextIndex = 0;
+      let activeWorkers = 0;
+      let targetConcurrency = Math.min(INITIAL_BATCH_CONCURRENCY, queue.length);
+      let stableSuccesses = 0;
+      let recoverySuccesses = 3;
       let fatalError = null;
 
       const report = () => onProgress({
@@ -232,26 +252,60 @@
         completed: succeeded.length + failed.length,
         total: queue.length,
         succeeded: succeeded.length,
-        failed: failed.length
+        failed: failed.length,
+        concurrency: targetConcurrency
       });
       report();
 
-      async function worker() {
-        while (nextIndex < queue.length && !signal?.aborted && !fatalError) {
-          const id = queue[nextIndex++];
+      await new Promise((resolve) => {
+        const schedule = () => {
+          while (activeWorkers < targetConcurrency && nextIndex < queue.length && !signal?.aborted && !fatalError) {
+            const id = queue[nextIndex++];
+            activeWorkers += 1;
+            void process(id).finally(() => {
+              activeWorkers -= 1;
+              if ((nextIndex >= queue.length || signal?.aborted || fatalError) && activeWorkers === 0) resolve();
+              else schedule();
+            });
+          }
+          if ((nextIndex >= queue.length || signal?.aborted || fatalError) && activeWorkers === 0) resolve();
+        };
+
+        async function process(id) {
           try {
-            await mutateConversation(action, id, signal);
+            await mutateConversation(action, id, signal, {
+              onRateLimit() {
+                // Do not start more work after a 429.  In-flight requests are
+                // allowed to finish, then the batch continues one at a time.
+                targetConcurrency = 1;
+                stableSuccesses = 0;
+                recoverySuccesses = 0;
+              }
+            });
             succeeded.push(id);
+            if (recoverySuccesses < 3) {
+              recoverySuccesses += 1;
+            } else {
+              stableSuccesses += 1;
+              if (targetConcurrency < MAX_BATCH_CONCURRENCY && stableSuccesses >= targetConcurrency) {
+                targetConcurrency += 1;
+                stableSuccesses = 0;
+              }
+            }
+            onItemResult({ id, status: "succeeded", action });
           } catch (error) {
-            if (isAbortError(error)) break;
-            failed.push({ id, message: friendlyError(error) });
-            if (error && error.fatal) fatalError = error;
+            if (!isAbortError(error)) {
+              const failure = { id, message: friendlyError(error) };
+              failed.push(failure);
+              onItemResult({ ...failure, status: "failed", action });
+              if (error && error.fatal) fatalError = error;
+            }
           }
           report();
         }
+        schedule();
       }
-
-      await Promise.all(Array.from({ length: Math.min(3, queue.length) }, () => worker()));
+      );
       const finished = new Set([...succeeded, ...failed.map((item) => item.id)]);
       const unprocessed = queue.filter((id) => !finished.has(id));
       return { succeeded, failed, unprocessed, fatalError: fatalError ? friendlyError(fatalError) : null };
@@ -509,6 +563,8 @@
     }
 
     async function loadProjectIds(signal) {
+      const cached = projectDiscoveryCache.get(activeAccountId);
+      if (cached && cached.expiresAt > now()) return [...cached.ids];
       const projects = [];
       let cursor = null;
       let offset = 0;
@@ -536,7 +592,9 @@
         }
         break;
       }
-      return [...new Set(projects)];
+      const ids = [...new Set(projects)];
+      projectDiscoveryCache.set(activeAccountId, { ids, expiresAt: now() + PROJECT_DISCOVERY_TTL_MS });
+      return ids;
     }
 
     function validateProjectSidebar(payload) {
@@ -588,7 +646,7 @@
       return { ids, rows };
     }
 
-    async function mutateConversation(action, id, signal) {
+    async function mutateConversation(action, id, signal, { onRateLimit = () => {} } = {}) {
       const path = `/backend-api/conversation/${encodeURIComponent(id)}`;
       const method = "PATCH";
       const body = JSON.stringify(action === "delete"
@@ -605,6 +663,7 @@
           throw new ChatHistoryError("登录状态已失效，已停止后续操作。", response.status, true);
         }
         if ((response.status === 429 || response.status >= 500) && attempt < 2) {
+          if (response.status === 429) onRateLimit();
           const retryAfter = Number(response.headers.get("retry-after"));
           const delay = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : [600, 1500][attempt];
           await sleep(delay, signal);
@@ -732,6 +791,18 @@
     return first.every((record, index) => fields.every((field) => record?.[field] === second[index]?.[field]));
   }
 
+  function applyConfirmedBatchItem(records, selected, item) {
+    const nextSelected = new Set(selected || []);
+    if (!item || item.status !== "succeeded" || !item.id) {
+      return { records: Array.isArray(records) ? records : [], selected: nextSelected };
+    }
+    nextSelected.delete(item.id);
+    return {
+      records: (records || []).filter((record) => record.id !== item.id),
+      selected: nextSelected
+    };
+  }
+
   function createThrottledUpdater(callback, {
     interval = 100,
     now = () => Date.now(),
@@ -771,6 +842,202 @@
     });
   }
 
+  // Keeps authentication, account-scoped cache hydration, record merging and
+  // deferred mutation writes in one place.  The UI only owns presentation
+  // state, which makes a reopened manager reuse its already-verified view
+  // instead of rebuilding it from storage every time.
+  function createConversationSyncEngine({ repository, indexStore, now = () => Date.now(), freshMs = CACHE_FRESH_MS, schedule = setTimeout, cancelSchedule = clearTimeout } = {}) {
+    if (!repository) throw new Error("ConversationSyncEngine requires a repository.");
+    const snapshots = new Map();
+    const generations = new Map();
+    const accountWrites = new Map();
+    const pendingMutations = new Map();
+    const mutationJournal = new Map();
+
+    async function load({ accountId, view, forceFull = false, forceIncremental = false, signal, onAuthenticated = () => {}, onCached = () => {}, onProgress = () => {}, onPage = () => {} } = {}) {
+      const auth = await repository.bootstrap({ accountId, signal });
+      // A locally confirmed operation has priority over a just-started list
+      // request.  Drain it before reading the persisted base for this sync.
+      await flushMutations(auth.accountId);
+      const viewKey = `${auth.accountId}:${view}`;
+      const generation = advanceGeneration(viewKey);
+      onAuthenticated(auth);
+      const snapshot = snapshots.get(viewKey);
+      if (snapshot) onCached(snapshot, { memory: true });
+
+      let cached = snapshot || null;
+      let cacheError = null;
+      if (indexStore) {
+        try {
+          const persisted = await indexStore.read(auth.accountId, view);
+          if (persisted) {
+            cached = persisted;
+            snapshots.set(viewKey, persisted);
+            onCached(persisted, { memory: false });
+          }
+        } catch (error) {
+          cacheError = error;
+        }
+      }
+      if (!isCurrent(viewKey, generation)) return { stale: true };
+      const selectedMode = core.chooseSyncMode({
+        hasCache: Boolean(cached), syncedAt: cached?.syncedAt, now: now(), forceFull, forceIncremental, freshMs
+      });
+      const mode = view === "scheduled" ? "full" : selectedMode;
+      const streamed = new Map((cached?.records || []).map((record) => [
+        record.id, view === "active" ? { ...record, pinned: false } : record
+      ]));
+      const result = await repository.loadAll({
+        accountId: auth.accountId,
+        archiveState: view,
+        mode,
+        cachedRecords: cached?.records || [],
+        checkpoints: cached?.checkpoints || {},
+        signal,
+        onProgress,
+        onPage(page) {
+          for (const record of page.records || []) streamed.set(record.id, record);
+          onPage(page);
+        }
+      });
+      if (!isCurrent(viewKey, generation)) return { stale: true };
+      const records = mode === "full" || view === "scheduled"
+        ? result.records
+        : core.mergeConversations([[...streamed.values()], result.records]);
+      const journalledRecords = applyMutationJournal(auth.accountId, view, records);
+      const syncedAt = now();
+      let writeError = null;
+      if (indexStore && result.compatible) {
+        try {
+          await enqueueAccountWrite(result.accountId, async () => {
+            if (!isCurrent(viewKey, generation)) return;
+            await indexStore.write(result.accountId, view, {
+              records: journalledRecords,
+              syncedAt,
+              fullSyncedAt: mode === "full" ? syncedAt : (cached?.fullSyncedAt || 0),
+              checkpoints: result.checkpoints
+            });
+          });
+        } catch (error) {
+          writeError = error;
+        }
+      }
+      if (!isCurrent(viewKey, generation)) return { stale: true };
+      if (result.compatible) {
+        snapshots.set(viewKey, {
+          records: journalledRecords,
+          syncedAt,
+          fullSyncedAt: mode === "full" ? syncedAt : (cached?.fullSyncedAt || 0),
+          checkpoints: result.checkpoints
+        });
+      }
+      return { auth, cached, cacheError, writeError, mode, records: journalledRecords, result, syncedAt };
+    }
+
+    function queueMutation({ accountId, action, id, record, onError = () => {} } = {}) {
+      if (!accountId || !id || !record) return;
+      patchSnapshots(accountId, action, id, record);
+      rememberMutation(accountId, action, id, record);
+      if (!indexStore) return;
+      const pending = pendingMutations.get(accountId) || { operations: [], timer: null, onError };
+      pending.operations.push({ action, succeeded: [id], records: [record] });
+      pending.onError = onError;
+      pendingMutations.set(accountId, pending);
+      if (pending.timer === null) pending.timer = schedule(() => { void flushMutations(accountId); }, 150);
+    }
+
+    function advanceGeneration(viewKey) {
+      const next = (generations.get(viewKey) || 0) + 1;
+      generations.set(viewKey, next);
+      return next;
+    }
+
+    function isCurrent(viewKey, generation) {
+      return generations.get(viewKey) === generation;
+    }
+
+    function enqueueAccountWrite(accountId, task) {
+      const previous = accountWrites.get(accountId) || Promise.resolve();
+      const next = previous.catch(() => {}).then(task);
+      accountWrites.set(accountId, next);
+      return next;
+    }
+
+    function rememberMutation(accountId, action, id, record) {
+      const journal = mutationJournal.get(accountId) || new Map();
+      // The journal bridges the short eventual-consistency window after a
+      // confirmed PATCH. It must expire so a later full calibration can again
+      // reflect authoritative changes made on another device.
+      journal.set(id, { action, record: { ...record }, expiresAt: now() + MUTATION_JOURNAL_TTL_MS });
+      mutationJournal.set(accountId, journal);
+      advanceGeneration(`${accountId}:active`);
+      advanceGeneration(`${accountId}:archived`);
+    }
+
+    function applyMutationJournal(accountId, view, records) {
+      const journal = mutationJournal.get(accountId);
+      if (!journal?.size || view === "scheduled") return records;
+      const byId = new Map((records || []).map((record) => [record.id, record]));
+      for (const [id, mutation] of journal) {
+        if (!Number.isFinite(mutation.expiresAt) || mutation.expiresAt <= now()) {
+          journal.delete(id);
+          continue;
+        }
+        if (mutation.action === "delete") byId.delete(id);
+        else if (mutation.action === "archive") {
+          if (view === "active") byId.delete(id);
+          else byId.set(id, { ...mutation.record, archived: true });
+        } else if (mutation.action === "restore") {
+          if (view === "archived") byId.delete(id);
+          else byId.set(id, { ...mutation.record, archived: false });
+        }
+      }
+      if (!journal.size) mutationJournal.delete(accountId);
+      return core.mergeConversations([[...byId.values()]]);
+    }
+
+    function patchSnapshots(accountId, action, id, record) {
+      const activeKey = `${accountId}:active`;
+      const archivedKey = `${accountId}:archived`;
+      const active = snapshots.get(activeKey);
+      const archived = snapshots.get(archivedKey);
+      const remove = (snapshot) => snapshot && { ...snapshot, records: snapshot.records.filter((item) => item.id !== id), syncedAt: now() };
+      const nextActive = remove(active);
+      const nextArchived = remove(archived);
+      if (nextActive) snapshots.set(activeKey, nextActive);
+      if (nextArchived) snapshots.set(archivedKey, nextArchived);
+      if (action === "archive" && nextArchived) {
+        snapshots.set(archivedKey, {
+          ...nextArchived,
+          records: core.mergeConversations([nextArchived.records, [{ ...record, archived: true }]])
+        });
+      }
+      if (action === "restore" && nextActive) {
+        snapshots.set(activeKey, {
+          ...nextActive,
+          records: core.mergeConversations([nextActive.records, [{ ...record, archived: false }]])
+        });
+      }
+    }
+
+    async function flushMutations(accountId) {
+      const pending = pendingMutations.get(accountId);
+      if (!pending?.operations.length) {
+        await accountWrites.get(accountId);
+        return;
+      }
+      if (pending.timer !== null) cancelSchedule(pending.timer);
+      pendingMutations.delete(accountId);
+      try {
+        await enqueueAccountWrite(accountId, () => indexStore.applyBatches(accountId, pending.operations));
+      } catch (error) {
+        pending.onError(error);
+      }
+    }
+
+    return Object.freeze({ flushMutations, load, queueMutation });
+  }
+
   function currentConversationId() {
     const match = location.pathname.match(/\/c\/([^/?#]+)/);
     return match ? match[1] : null;
@@ -792,13 +1059,7 @@
 
   function formatDate(timestamp) {
     if (!Number.isFinite(timestamp)) return "时间未知";
-    return new Intl.DateTimeFormat("zh-CN", {
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit"
-    }).format(new Date(timestamp));
+    return DATE_FORMATTER.format(new Date(timestamp));
   }
 
   function getEmptyStateLabel({ loading = false, query = "", view = "active" } = {}) {
@@ -810,7 +1071,9 @@
   if (typeof module !== "undefined" && module.exports) {
     module.exports = Object.freeze({
       ChatHistoryError,
+      applyConfirmedBatchItem,
       createChatHistoryRepository,
+      createConversationSyncEngine,
       createThrottledUpdater,
       conversationRecordsEqual,
       getEmptyStateLabel
@@ -822,12 +1085,14 @@
   const memoryStorage = {};
   const storageAdapter = createStorageAdapter();
   const indexStore = indexApi ? indexApi.createConversationIndexStore({ storage: storageAdapter }) : null;
+  const syncEngine = createConversationSyncEngine({ repository, indexStore });
   const state = {
     open: false,
     view: "active",
     timeFilter: core.TIME_FILTER.ALL,
     query: "",
     records: [],
+    recordById: new Map(),
     filteredRecords: [],
     renderedCount: 0,
     selected: new Set(),
@@ -852,6 +1117,11 @@
   let ui = null;
   let previouslyFocusedElement = null;
   let searchTimer = null;
+
+  function setRecords(records) {
+    state.records = Array.isArray(records) ? records : [];
+    state.recordById = new Map(state.records.map((record) => [record.id, record]));
+  }
 
   function createStorageAdapter() {
     const local = globalThis.chrome?.storage?.local;
@@ -890,7 +1160,7 @@
     state.view = "active";
     state.timeFilter = core.TIME_FILTER.ALL;
     state.query = "";
-    state.records = [];
+    setRecords([]);
     state.loadedViewKey = "";
     state.selected.clear();
     state.confirmDelete = false;
@@ -1053,7 +1323,7 @@
 
   function resetForViewChange() {
     state.loadController?.abort();
-    state.records = [];
+    setRecords([]);
     state.loadedViewKey = "";
     state.cacheSyncedAt = 0;
     state.result = "";
@@ -1082,97 +1352,48 @@
       updateSyncStatus();
     });
     try {
-      const auth = await repository.bootstrap({ accountId: state.accountId, signal: controller.signal });
-      if (controller.signal.aborted) return;
-      state.accounts = auth.accounts;
-      state.accountId = auth.accountId;
-      const viewKey = `${auth.accountId}:${requestedView}`;
-      let cached = null;
-      if (indexStore) {
-        try {
-          cached = await indexStore.read(auth.accountId, requestedView);
-        } catch (error) {
-          state.cacheWarning = `本地缓存不可用：${friendlyError(error)}`;
-        }
-      }
-      if (controller.signal.aborted) return;
-      if (cached) {
-        state.cacheSyncedAt = cached.syncedAt;
-        state.syncMessage = `本地缓存 · 上次同步 ${formatSyncTime(cached.syncedAt)}`;
-        const shouldHydrateCachedView = state.loadedViewKey !== viewKey || state.records.length === 0;
-        if (shouldHydrateCachedView) {
-          state.records = cached.records;
-          state.loadedViewKey = viewKey;
-          updateAll({ rebuildList: true });
-        } else {
-          updateAll();
-        }
-      } else if (state.loadedViewKey !== viewKey) {
-        state.records = [];
-        state.loadedViewKey = viewKey;
-        state.cacheSyncedAt = 0;
-        updateAll({ rebuildList: true });
-      }
-
-      const selectedMode = core.chooseSyncMode({
-        hasCache: Boolean(cached),
-        syncedAt: cached?.syncedAt,
-        now: Date.now(),
+      const sync = await syncEngine.load({
+        accountId: state.accountId,
+        view: requestedView,
         forceFull,
         forceIncremental,
-        freshMs: CACHE_FRESH_MS
-      });
-      const mode = requestedView === "scheduled" ? "full" : selectedMode;
-      const viewLabel = requestedView === "scheduled" ? "已安排会话" : "聊天";
-      state.syncMessage = mode === "full"
-        ? (cached ? `正在全量校准${viewLabel}，当前继续显示本地缓存…` : `正在首次读取${viewLabel}…`)
-        : mode === "incremental" ? "后台增量同步中，当前显示本地缓存…" : "正在验证缓存和接口状态…";
-      updateAll();
-      const streamedRecords = new Map((cached?.records || []).map((record) => [
-        record.id,
-        requestedView === "active" ? { ...record, pinned: false } : record
-      ]));
-      const result = await repository.loadAll({
-        accountId: auth.accountId,
-        archiveState: requestedView,
-        mode,
-        cachedRecords: cached?.records || [],
-        checkpoints: cached?.checkpoints || {},
         signal: controller.signal,
-        onProgress(progress) { progressUpdater.push(progress); },
-        onPage(page) {
-          for (const record of page.records || []) streamedRecords.set(record.id, record);
-        }
+        onAuthenticated(auth) {
+          state.accounts = auth.accounts;
+          state.accountId = auth.accountId;
+        },
+        onCached(cached) {
+          if (controller.signal.aborted) return;
+          const viewKey = `${state.accountId}:${requestedView}`;
+          state.cacheSyncedAt = cached.syncedAt;
+          state.syncMessage = `本地缓存 · 上次同步 ${formatSyncTime(cached.syncedAt)}`;
+          if (state.loadedViewKey !== viewKey || state.records.length === 0) {
+            setRecords(cached.records);
+            state.loadedViewKey = viewKey;
+            updateAll({ rebuildList: true });
+          } else updateAll();
+        },
+        onProgress(progress) { progressUpdater.push(progress); }
       });
       if (controller.signal.aborted) return;
+      if (sync.stale) return;
       progressUpdater.flush();
-      state.accounts = result.accounts;
-      state.accountId = result.accountId;
-      const syncedRecords = mode === "full" || requestedView === "scheduled"
-        ? result.records
-        : core.mergeConversations([[...streamedRecords.values()], result.records]);
+      const { result, records: syncedRecords, cached, mode, syncedAt } = sync;
       const recordsChanged = !conversationRecordsEqual(state.records, syncedRecords);
-      state.records = syncedRecords;
+      setRecords(syncedRecords);
       state.loadedViewKey = `${result.accountId}:${requestedView}`;
       state.warnings = result.warnings;
       state.protectionVerified = result.protectionVerified;
       state.canMutate = result.canMutate;
-      const syncedAt = Date.now();
       state.cacheSyncedAt = result.compatible ? syncedAt : (cached?.syncedAt || 0);
-      if (indexStore && result.compatible) {
-        try {
-          await indexStore.write(result.accountId, requestedView, {
-            records: syncedRecords,
-            syncedAt,
-            fullSyncedAt: mode === "full" ? syncedAt : (cached?.fullSyncedAt || 0),
-            checkpoints: result.checkpoints
-          });
-        } catch (error) {
-          state.cacheWarning = `会话已保留在内存中，但本地索引写入失败：${friendlyError(error)}`;
-        }
+      if (sync.cacheError) {
+        state.cacheWarning = `本地缓存不可用：${friendlyError(sync.cacheError)}`;
+      } else if (sync.writeError) {
+        state.cacheWarning = `会话已保留在内存中，但本地索引写入失败：${friendlyError(sync.writeError)}`;
       } else if (!result.compatible && cached) {
         state.cacheWarning = "接口兼容性检查未通过，本次结果没有覆盖本地索引。";
       }
+      const viewLabel = requestedView === "scheduled" ? "已安排会话" : "聊天";
       state.syncMessage = result.compatible
         ? `同步完成 · ${syncedRecords.length} 条${viewLabel} · ${formatSyncTime(syncedAt)}`
         : "需要全量刷新 · 当前接口兼容性检查未通过";
@@ -1207,6 +1428,7 @@
     const ids = [...state.selected];
     if (!ids.length || state.running || state.loading || !state.canMutate) return;
     const affectedRecords = state.records.filter((record) => state.selected.has(record.id));
+    const affectedById = new Map(affectedRecords.map((record) => [record.id, record]));
     const controller = new AbortController();
     state.confirmDelete = false;
     state.batchController = controller;
@@ -1220,24 +1442,40 @@
       state.progress = progress;
       updateFooter();
     });
+    const successUpdater = createThrottledUpdater(() => {
+      if (!state.open || state.batchController !== controller) return;
+      updateAll({ rebuildList: true, preserveScroll: true });
+    });
     try {
       const result = await repository.runBatch({
         action,
         ids,
         signal: controller.signal,
-        onProgress(progress) { progressUpdater.push(progress); }
+        onProgress(progress) { progressUpdater.push(progress); },
+        onItemResult(item) {
+          // Only a confirmed success is allowed to disappear.  Failed and
+          // aborted work remains selected for an explicit retry.
+          if (item.status !== "succeeded") return;
+          const record = affectedById.get(item.id);
+          if (!record) return;
+          const nextView = applyConfirmedBatchItem(state.records, state.selected, item);
+          setRecords(nextView.records);
+          state.selected = nextView.selected;
+          syncEngine.queueMutation({
+            accountId: state.accountId,
+            action,
+            id: item.id,
+            record,
+            onError(error) {
+              state.cacheWarning = `操作已完成，但本地索引更新失败：${friendlyError(error)}。请执行全量刷新。`;
+            }
+          });
+          successUpdater.push(item.id);
+        }
       });
       progressUpdater.flush();
-      const succeeded = new Set(result.succeeded);
-      state.records = state.records.filter((record) => !succeeded.has(record.id));
       state.selected = new Set([...result.failed.map((item) => item.id), ...result.unprocessed]);
-      if (indexStore && result.succeeded.length) {
-        try {
-          await indexStore.applyBatch(state.accountId, { action, succeeded: result.succeeded, records: affectedRecords });
-        } catch (error) {
-          state.cacheWarning = `操作已完成，但本地索引更新失败：${friendlyError(error)}。请执行全量刷新。`;
-        }
-      }
+      await syncEngine.flushMutations(state.accountId);
       const details = [
         `成功 ${result.succeeded.length} 条`,
         `失败 ${result.failed.length} 条`,
@@ -1267,6 +1505,7 @@
       if (!isAbortError(error)) state.error = friendlyError(error);
     } finally {
       progressUpdater.cancel();
+      successUpdater.cancel();
       state.running = false;
       state.progress = null;
       state.batchController = null;
@@ -1475,19 +1714,14 @@
     ui.primary.disabled = writeDisabled;
     ui.remove.disabled = writeDisabled;
     for (const checkbox of ui.list.querySelectorAll(".cgn-manager-checkbox")) {
-      const record = state.filteredRecords.find((item) => item.id === checkbox.closest(".cgn-manager-row")?.dataset.conversationId);
+      const record = state.recordById.get(checkbox.closest(".cgn-manager-row")?.dataset.conversationId);
       checkbox.disabled = VIEW_CONFIG[state.view].readOnly || state.loading || state.running || !state.canMutate || Boolean(record?.automation);
     }
   }
 
   function formatSyncTime(timestamp) {
     if (!Number.isFinite(timestamp) || timestamp <= 0) return "未知";
-    return new Intl.DateTimeFormat("zh-CN", {
-      month: "2-digit",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit"
-    }).format(new Date(timestamp));
+    return SYNC_TIME_FORMATTER.format(new Date(timestamp));
   }
 
   document.addEventListener(OPEN_EVENT, openManager);
